@@ -1,0 +1,8 @@
+[package]
+edition = "2024"
+name = "vagus"
+version = "0.1.0"
+
+[dependencies]
+ash = "0.38.0"
+libc = "0.2"
