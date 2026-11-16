@@ -10,7 +10,7 @@ mod virtual_memory {
     use super::*;
 
     fn page_size() -> io::Result<usize> {
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page: i64 = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page <= 0 || !(page as usize).is_power_of_two() {
             return Err(io::Error::other("invalid system page size"));
         }
@@ -23,9 +23,10 @@ mod virtual_memory {
         }
         value
             .checked_add(alignment - 1)
-            .map(|v| v & !(alignment - 1))
+            .map(|v: usize| v & !(alignment - 1))
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Region {
         base: NonNull<u8>,
         reserved: usize,
@@ -206,7 +207,7 @@ mod virtual_memory {
     }
 }
 
-use virtual_memory::Region;
+pub use virtual_memory::Region;
 
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
@@ -348,10 +349,6 @@ impl Allocator {
         Ok(ptr)
     }
 
-    /// Releases a live allocation made by this allocator.
-    ///
-    /// # Safety
-    /// `ptr` must be a live allocation returned by this allocator and not already freed.
     pub unsafe fn deallocate_unsafe(&mut self, ptr: NonNull<u8>) -> bool {
         if let Some(allocation) = self.allocations.remove(&(ptr.as_ptr() as usize)) {
             self.chunks[allocation.chunk].free.push(allocation.block);
@@ -361,10 +358,6 @@ impl Allocator {
         }
     }
 
-    /// Reallocates a live block, preserving its contents up to the smaller size.
-    ///
-    /// # Safety
-    /// `ptr` must be a live allocation returned by this allocator for `old_layout`.
     pub unsafe fn realloc(
         &mut self,
         ptr: NonNull<u8>,

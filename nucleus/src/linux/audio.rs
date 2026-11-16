@@ -55,7 +55,6 @@ impl Default for AudioConfig {
     }
 }
 
-/// Non-blocking interleaved floating-point audio output backed by ALSA.
 pub struct AudioOutput {
     pcm: *mut SndPcm,
     config: AudioConfig,
@@ -100,8 +99,8 @@ impl AudioOutput {
         self.config
     }
 
-    /// Attempts to write interleaved samples without waiting for device capacity.
-    /// Returns the number of frames accepted, which may be less than requested.
+    /// Attempts to write interleaved samples without waiting for device capacity
+    /// Returns the number of frames accepted, which may be less than requested
     pub fn write_samples(&mut self, samples: &[f32]) -> Result<usize, String> {
         let channels = usize::from(self.config.channels);
         if !samples.len().is_multiple_of(channels) {

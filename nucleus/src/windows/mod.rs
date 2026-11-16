@@ -1,10 +1,12 @@
+pub mod audio;
+
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
-use crate::nucleus::Event;
+use crate::Event;
 
 type Handle = *mut c_void;
 type HInstance = Handle;
@@ -66,6 +68,14 @@ struct Msg {
     private: u32,
 }
 
+#[repr(C)]
+struct TrackMouseEvent {
+    size: u32,
+    flags: u32,
+    handle: Handle,
+    hover_time: u32,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> HInstance;
@@ -93,9 +103,12 @@ unsafe extern "system" {
     fn DefWindowProcW(hwnd: Handle, message: u32, wparam: WParam, lparam: LParam) -> LResult;
     fn DestroyWindow(hwnd: Handle) -> i32;
     fn ShowWindow(hwnd: Handle, command: i32) -> i32;
+    fn SetWindowTextW(hwnd: Handle, text: *const u16) -> i32;
+    fn SetForegroundWindow(hwnd: Handle) -> i32;
     fn PeekMessageW(message: *mut Msg, hwnd: Handle, min: u32, max: u32, remove: u32) -> i32;
     fn TranslateMessage(message: *const Msg) -> i32;
     fn DispatchMessageW(message: *const Msg) -> LResult;
+    fn TrackMouseEvent(event: *mut TrackMouseEvent) -> i32;
     fn GetWindowLongPtrW(hwnd: Handle, index: i32) -> isize;
     fn SetWindowLongPtrW(hwnd: Handle, index: i32, value: isize) -> isize;
     fn GetWindowRect(hwnd: Handle, rect: *mut Rect) -> i32;
@@ -128,6 +141,10 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOOWNERZORDER: u32 = 0x0200;
 const SWP_FRAMECHANGED: u32 = 0x0020;
 const SW_SHOW: i32 = 5;
+const SW_HIDE: i32 = 0;
+const SW_MINIMIZE: i32 = 6;
+const SW_MAXIMIZE: i32 = 3;
+const SW_RESTORE: i32 = 9;
 const PM_REMOVE: u32 = 1;
 const WM_CLOSE: u32 = 0x0010;
 const WM_SIZE: u32 = 0x0005;
@@ -140,14 +157,31 @@ const WM_RBUTTONDOWN: u32 = 0x0204;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSEWHEEL: u32 = 0x020a;
+const WM_XBUTTONDOWN: u32 = 0x020b;
+const WM_XBUTTONUP: u32 = 0x020c;
+const WM_MOUSEHWHEEL: u32 = 0x020e;
+const WM_MOUSELEAVE: u32 = 0x02a3;
+const WM_MOVE: u32 = 0x0003;
+const WM_SETFOCUS: u32 = 0x0007;
+const WM_KILLFOCUS: u32 = 0x0008;
+const WM_CHAR: u32 = 0x0102;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
+const WM_SYSCHAR: u32 = 0x0106;
+const TME_LEAVE: u32 = 0x00000002;
+const WHEEL_DELTA: f64 = 120.0;
 const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 
 thread_local! {
     static EVENTS: RefCell<HashMap<isize, VecDeque<Event>>> = RefCell::new(HashMap::new());
+    static POINTER_INSIDE: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
+    static PENDING_HIGH_SURROGATE: RefCell<HashMap<isize, u16>> = RefCell::new(HashMap::new());
 }
 
 pub struct Window {
     handle: Handle,
+    instance: HInstance,
     fullscreen: bool,
     windowed_rect: Option<Rect>,
 }
@@ -212,9 +246,14 @@ impl Window {
         unsafe { ShowWindow(handle, SW_SHOW) };
         Ok(Self {
             handle,
+            instance,
             fullscreen: false,
             windowed_rect: None,
         })
+    }
+
+    pub fn vulkan_handles(&self) -> (Handle, Handle) {
+        (self.instance, self.handle)
     }
 
     pub fn apply_cfg(
@@ -279,6 +318,69 @@ impl Window {
             )?;
         }
         self.fullscreen = fullscreen;
+        Ok(())
+    }
+
+    pub fn set_title(&mut self, title: &str) -> Result<(), String> {
+        let title: Vec<u16> = OsStr::new(title)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if unsafe { SetWindowTextW(self.handle, title.as_ptr()) } == 0 {
+            return Err(last_error("SetWindowTextW"));
+        }
+        Ok(())
+    }
+
+    pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let width =
+            i32::try_from(width).map_err(|_| "window width exceeds the Windows API limit")?;
+        let height =
+            i32::try_from(height).map_err(|_| "window height exceeds the Windows API limit")?;
+        if width <= 0 || height <= 0 {
+            return Err("window dimensions must be positive".into());
+        }
+        let mut rect = Rect::default();
+        if unsafe { GetWindowRect(self.handle, &mut rect) } == 0 {
+            return Err(last_error("GetWindowRect"));
+        }
+        set_window_position(
+            self.handle,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            SWP_NOOWNERZORDER,
+        )
+    }
+
+    pub fn set_position(&mut self, x: i32, y: i32) -> Result<(), String> {
+        set_window_position(self.handle, x, y, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE)
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        unsafe { ShowWindow(self.handle, if visible { SW_SHOW } else { SW_HIDE }) };
+    }
+
+    pub fn set_window_state(&mut self, minimized: bool, maximized: bool) -> Result<(), String> {
+        if minimized && maximized {
+            return Err("a window cannot be minimized and maximized simultaneously".into());
+        }
+        let command = if minimized {
+            SW_MINIMIZE
+        } else if maximized {
+            SW_MAXIMIZE
+        } else {
+            SW_RESTORE
+        };
+        unsafe { ShowWindow(self.handle, command) };
+        Ok(())
+    }
+
+    pub fn request_focus(&mut self) -> Result<(), String> {
+        if unsafe { SetForegroundWindow(self.handle) } == 0 {
+            return Err("Windows declined the foreground activation request".into());
+        }
         Ok(())
     }
 
@@ -363,6 +465,12 @@ impl Drop for Window {
         EVENTS.with(|events| {
             events.borrow_mut().remove(&(self.handle as isize));
         });
+        POINTER_INSIDE.with(|windows| {
+            windows.borrow_mut().remove(&(self.handle as isize));
+        });
+        PENDING_HIGH_SURROGATE.with(|units| {
+            units.borrow_mut().remove(&(self.handle as isize));
+        });
     }
 }
 
@@ -378,14 +486,20 @@ unsafe extern "system" fn window_proc(
             width: lparam as u32 & 0xffff,
             height: (lparam as u32 >> 16) & 0xffff,
         }),
-        WM_KEYDOWN => Some(Event::Key {
+        WM_KEYDOWN | WM_SYSKEYDOWN => Some(Event::Key {
             code: wparam as u32,
             pressed: true,
         }),
-        WM_KEYUP => Some(Event::Key {
+        WM_KEYUP | WM_SYSKEYUP => Some(Event::Key {
             code: wparam as u32,
             pressed: false,
         }),
+        WM_MOVE => Some(Event::Moved {
+            x: lparam as u16 as i16 as i32,
+            y: (lparam as u32 >> 16) as u16 as i16 as i32,
+        }),
+        WM_SETFOCUS => Some(Event::Focused { focused: true }),
+        WM_KILLFOCUS => Some(Event::Focused { focused: false }),
         WM_MOUSEMOVE => Some(Event::PointerMoved {
             x: lparam as u16 as i16 as i32,
             y: (lparam as u32 >> 16) as u16 as i16 as i32,
@@ -414,14 +528,80 @@ unsafe extern "system" fn window_proc(
             button: 3,
             pressed: false,
         }),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => Some(Event::PointerButton {
+            button: ((wparam >> 16) as u16 as u32) + 3,
+            pressed: message == WM_XBUTTONDOWN,
+        }),
+        WM_MOUSEWHEEL => Some(Event::Scroll {
+            delta_x: 0.0,
+            delta_y: ((wparam >> 16) as u16 as i16) as f64 / WHEEL_DELTA,
+        }),
+        WM_MOUSEHWHEEL => Some(Event::Scroll {
+            delta_x: ((wparam >> 16) as u16 as i16) as f64 / WHEEL_DELTA,
+            delta_y: 0.0,
+        }),
         _ => None,
     };
     if let Some(event) = event {
-        EVENTS.with(|events| {
-            if let Some(queue) = events.borrow_mut().get_mut(&(handle as isize)) {
-                queue.push_back(event);
+        queue_event(handle, event);
+    }
+    if message == WM_MOUSEMOVE {
+        let first_move =
+            POINTER_INSIDE.with(|windows| windows.borrow_mut().insert(handle as isize));
+        if first_move {
+            let mut tracking = TrackMouseEvent {
+                size: std::mem::size_of::<TrackMouseEvent>() as u32,
+                flags: TME_LEAVE,
+                handle,
+                hover_time: 0,
+            };
+            unsafe { TrackMouseEvent(&mut tracking) };
+            queue_event(handle, Event::PointerEntered);
+        }
+    } else if message == WM_MOUSELEAVE {
+        let was_inside =
+            POINTER_INSIDE.with(|windows| windows.borrow_mut().remove(&(handle as isize)));
+        if was_inside {
+            queue_event(handle, Event::PointerLeft);
+        }
+    }
+    if message == WM_CHAR || message == WM_SYSCHAR {
+        let unit = wparam as u16;
+        let decoded = PENDING_HIGH_SURROGATE.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if (0xd800..=0xdbff).contains(&unit) {
+                pending.insert(handle as isize, unit);
+                None
+            } else if (0xdc00..=0xdfff).contains(&unit) {
+                pending
+                    .remove(&(handle as isize))
+                    .and_then(|high| char::decode_utf16([high, unit]).next().and_then(Result::ok))
+            } else {
+                pending.remove(&(handle as isize));
+                char::from_u32(unit as u32)
             }
         });
+        if let Some(character) = decoded {
+            queue_event(
+                handle,
+                Event::TextInput {
+                    codepoint: character as u32,
+                },
+            );
+        }
     }
-    unsafe { DefWindowProcW(handle, message, wparam, lparam) }
+    let result = unsafe { DefWindowProcW(handle, message, wparam, lparam) };
+    if message == WM_XBUTTONDOWN || message == WM_XBUTTONUP {
+        1
+    } else {
+        result
+    }
+}
+
+fn queue_event(handle: Handle, event: Event) {
+    EVENTS.with(|events| {
+        if let Some(queue) = events.borrow_mut().get_mut(&(handle as isize)) {
+            queue.push_back(event);
+        }
+    });
 }

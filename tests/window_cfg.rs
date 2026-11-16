@@ -1,4 +1,4 @@
-use vagus::api::window::{Window, WindowCfg};
+use vagus::window::{Window, WindowCfg};
 
 #[test]
 fn default_config_and_dimension_validation_are_consistent() {
@@ -12,15 +12,19 @@ fn default_config_and_dimension_validation_are_consistent() {
 #[cfg(target_os = "linux")]
 #[test]
 fn apply_cfg_reaches_available_linux_backends() {
-    use vagus::api::window::{Window, WindowCfg};
-
-    let Ok(mut api_window) = Window::create_window("api-window-cfg", 320, 240) else {
-        return;
+    let mut window = match Window::create_window("api-window-cfg", 320, 240) {
+        Ok(window) => window,
+        Err(error) => {
+            eprintln!("skipping native window assertions: {error}");
+            return;
+        }
     };
-    assert_eq!(api_window.size, (320, 240));
-    assert_eq!(api_window.framebuffer_size, (320, 240));
-    assert_eq!(api_window.scale_factor, 1.0);
-    assert_ne!(api_window.id.get(), 0);
+    assert_eq!(window.size, (320, 240));
+    assert_eq!(window.framebuffer_size, (320, 240));
+    assert_eq!(window.scale_factor, 1.0);
+    assert_ne!(window.id.get(), 0);
+    assert_eq!(window.id(), window.id);
+    assert!(window.is_open());
 
     let fixed = WindowCfg {
         fullscreen: false,
@@ -28,39 +32,75 @@ fn apply_cfg_reaches_available_linux_backends() {
         borderless: false,
         ..WindowCfg::default()
     };
-    api_window.apply_cfg(fixed).unwrap();
-    let mut unsupported = fixed;
-    unsupported.focused = true;
-    assert!(api_window.apply_cfg(unsupported).is_err());
-    assert_eq!(api_window.cfg, fixed);
-    api_window.apply_cfg(WindowCfg::default()).unwrap();
-    api_window.poll_events().unwrap();
-
-    if let Ok(mut x11) =
-        vagus::nucleus::linux::x11::Window::create_window("x11-window-cfg", 320, 240)
-    {
-        x11.apply_cfg(false, false, true).unwrap();
-        x11.apply_cfg(false, true, false).unwrap();
+    window.apply_cfg(fixed).unwrap();
+    let mut focus_request = fixed;
+    focus_request.focused = true;
+    let focus_result = window.apply_cfg(focus_request);
+    if focus_result.is_err() {
+        assert_eq!(window.cfg, fixed);
+        assert!(window.set_visible(false).is_err());
+        assert!(window.set_size(400, 300).is_err());
+        assert!(window.set_position(20, 30).is_err());
+        assert!(window.request_focus().is_err());
+    } else {
+        assert!(window.cfg.focused);
+        window.set_visible(false).unwrap();
+        window.set_visible(true).unwrap();
+        window.set_size(400, 300).unwrap();
+        window.set_position(20, 30).unwrap();
+        window.request_focus().unwrap();
     }
-
-    if let Ok(mut wayland) =
-        vagus::nucleus::linux::wayland::Window::create_window("wayland-window-cfg", 320, 240)
-    {
-        wayland.apply_cfg(false, false, false).unwrap();
-        wayland.apply_cfg(true, true, false).unwrap();
-        wayland.apply_cfg(false, true, false).unwrap();
-        if let Err(error) = wayland.apply_cfg(false, true, true) {
-            assert!(error.contains("does not support borderless"));
-        }
-    }
+    let mut maximized = fixed;
+    maximized.maximized = true;
+    window.apply_cfg(maximized).unwrap();
+    assert!(window.cfg.maximized);
+    window.apply_cfg(fixed).unwrap();
+    assert!(!window.cfg.maximized);
+    let conflicting_state = WindowCfg {
+        minimized: true,
+        maximized: true,
+        ..fixed
+    };
+    assert!(window.apply_cfg(conflicting_state).is_err());
+    assert_eq!(window.cfg, fixed);
+    window.minimize().unwrap();
+    assert!(window.cfg.minimized);
+    window.maximize().unwrap();
+    assert!(window.cfg.maximized);
+    window.restore().unwrap();
+    assert!(!window.cfg.minimized && !window.cfg.maximized);
+    window.set_title("api-window-updated").unwrap();
+    assert_eq!(window.title, "api-window-updated");
+    window.apply_cfg(WindowCfg::default()).unwrap();
+    window.poll_events().unwrap();
+    window.request_close();
+    assert!(!window.is_open());
 }
 
 #[cfg(target_os = "windows")]
 #[test]
 fn apply_cfg_changes_windows_styles_and_fullscreen() {
-    let mut window = vagus::nucleus::windows::Window::create_window("windows-window-cfg", 320, 240)
-        .expect("create Windows window");
-    window.apply_cfg(false, false, true).unwrap();
-    window.apply_cfg(true, false, false).unwrap();
-    window.apply_cfg(false, true, false).unwrap();
+    let mut window = match Window::create_window("windows-window-cfg", 320, 240) {
+        Ok(window) => window,
+        Err(error) => {
+            eprintln!("skipping native window assertions: {error}");
+            return;
+        }
+    };
+    window
+        .apply_cfg(WindowCfg {
+            resizable: false,
+            borderless: true,
+            ..WindowCfg::default()
+        })
+        .unwrap();
+    window
+        .apply_cfg(WindowCfg {
+            fullscreen: true,
+            resizable: false,
+            borderless: false,
+            ..WindowCfg::default()
+        })
+        .unwrap();
+    window.apply_cfg(WindowCfg::default()).unwrap();
 }

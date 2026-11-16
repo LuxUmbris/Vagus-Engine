@@ -3,6 +3,16 @@ edition = "2024"
 name = "vagus"
 version = "0.1.0"
 
+[workspace]
+members = ["nucleus", "soa_derive", "vagus_essential"]
+resolver = "3"
+
 [dependencies]
-ash = "0.38.0"
-libc = "0.2"
+nucleus = {path = "nucleus"}
+soa_derive = {path = "soa_derive"}
+vagus_essential = {path = "vagus_essential"}
+vstd = "0.0.0-2026-11-08-0256"
+
+[profile.release]
+lto = true
+opt-level = 3

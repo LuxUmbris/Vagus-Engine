@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1, std430) buffer Pixels { uint rgba[]; } pixels;
+layout(push_constant) uniform Camera {
+    vec4 origin;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    float tan_half_fov;
+    uint width;
+    uint height;
+} camera;
+layout(location = 0) rayPayloadEXT vec3 color;
+void main() {
+    uvec2 pixel = gl_LaunchIDEXT.xy;
+    vec2 ndc = ((vec2(pixel) + vec2(0.5)) / vec2(camera.width, camera.height)) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec3 direction = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * camera.tan_half_fov * float(camera.width) / float(camera.height) + camera.up.xyz * ndc.y * camera.tan_half_fov);
+    color = vec3(0.02, 0.04, 0.12);
+    traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, camera.origin.xyz, 0.001, direction, 10000.0, 0);
+    uvec3 rgb = uvec3(clamp(color, 0.0, 1.0) * 255.0 + 0.5);
+    pixels.rgba[pixel.y * camera.width + pixel.x] = rgb.r | (rgb.g << 8) | (rgb.b << 16) | 0xff000000;
+}
