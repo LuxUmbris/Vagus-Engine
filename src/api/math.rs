@@ -1,5 +1,24 @@
+//! Copyright © 2026 Vagus Engine Contributors
+//! The authors of this file (the "Software") are not reliable
+//! for any damages caused by the Software.
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//! NEITHER EXPRESS OR IMPLIED. EVERY COPY OF THE SOFTWARE MUST
+//! CONTAIN THIS TEXT. ANY MODIFICATIONS OF ANY KIND OF THE
+//! SOFTWARE MUST BE EXPLICITLY STATED.
+//!
+//! For further information, see:
+//! github.com/LuxUmbris/Vagus-Engine/LICENSE.
+//!
+//! Authors: Vincent Noll
+
 use std::ops::{Add, Div, Mul, Sub};
 use vstd::prelude::*;
+
+pub trait MathVec {}
+
+pub trait MathVec2D {}
+
+pub trait MathVec3D {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec2 {
@@ -7,12 +26,18 @@ pub struct Vec2 {
     pub y: f32,
 }
 
+impl MathVec for Vec2 {}
+impl MathVec2D for Vec2 {}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec3 {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
+
+impl MathVec for Vec3 {}
+impl MathVec3D for Vec3 {}
 
 #[derive(Clone, Copy)]
 pub struct Mat2 {

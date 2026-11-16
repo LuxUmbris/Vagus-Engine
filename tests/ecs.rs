@@ -1,4 +1,17 @@
-use vagus::ecs::{ECS, Soa};
+//! Copyright © 2026 Vagus Engine Contributors
+//! The authors of this file (the "Software") are not reliable
+//! for any damages caused by the Software.
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//! NEITHER EXPRESS OR IMPLIED. EVERY COPY OF THE SOFTWARE MUST
+//! CONTAIN THIS TEXT. ANY MODIFICATIONS OF ANY KIND OF THE
+//! SOFTWARE MUST BE EXPLICITLY STATED.
+//!
+//! For further information, see:
+//! github.com/LuxUmbris/Vagus-Engine/LICENSE.
+//!
+//! Authors: Vincent Noll
+
+use vagus::ecs::{ECS, Soa, SoaClone};
 
 #[derive(Soa, PartialEq, Eq)]
 struct Position {
@@ -58,6 +71,32 @@ fn derive_supports_tuple_unit_and_generic_structs() {
     let mut generic = ECS::<Generic<&str>>::with_capacity(1).unwrap();
     generic.push(Generic { value: "value" }).unwrap();
     assert_eq!(generic.storage().value.get(0), Some(&"value"));
+}
+
+#[test]
+fn unit_soa_generated_operations_track_rows_and_capacity() {
+    let mut storage = Empty::create_storage(2).unwrap();
+    assert!(Empty::clone_at(&storage, 0).is_none());
+    Empty::prepare_append(&mut storage, 2).unwrap();
+    assert!(Empty::prepare_append(&mut storage, 3).is_err());
+
+    Empty::push_to(&mut storage, Empty).unwrap();
+    Empty::insert(&mut storage, 0, Empty).unwrap();
+    assert!(Empty::push_to(&mut storage, Empty).is_err());
+    assert!(Empty::clone_at(&storage, 1).is_some());
+    assert!(Empty::clone_at(&storage, 2).is_none());
+
+    assert!(Empty::swap_remove(&mut storage, 0).is_some());
+    assert!(Empty::remove(&mut storage, 0).is_some());
+    assert!(Empty::push_to(&mut storage, Empty).is_ok());
+    assert!(Empty::push_to(&mut storage, Empty).is_ok());
+    assert!(Empty::pop_front(&mut storage).is_some());
+    assert!(Empty::pop(&mut storage).is_some());
+    assert!(Empty::pop(&mut storage).is_none());
+    assert!(Empty::truncate(&mut storage, 0));
+    assert!(!Empty::truncate(&mut storage, 1));
+    Empty::clear(&mut storage);
+    assert!(Empty::push_to(&mut storage, Empty).is_ok());
 }
 
 #[test]

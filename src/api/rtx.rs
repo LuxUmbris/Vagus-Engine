@@ -1,6 +1,19 @@
+//! Copyright © 2026 Vagus Engine Contributors
+//! The authors of this file (the "Software") are not reliable
+//! for any damages caused by the Software.
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//! NEITHER EXPRESS OR IMPLIED. EVERY COPY OF THE SOFTWARE MUST
+//! CONTAIN THIS TEXT. ANY MODIFICATIONS OF ANY KIND OF THE
+//! SOFTWARE MUST BE EXPLICITLY STATED.
+//!
+//! For further information, see:
+//! github.com/LuxUmbris/Vagus-Engine/LICENSE.
+//!
+//! Authors: Vincent Noll
+
 use nucleus::rtx::{
-    hardware_ray_tracing_supported, Camera as NucleusCamera, RtxRenderer as NucleusRenderer,
-    Triangle as NucleusTriangle,
+    Camera as NucleusCamera, RtxRenderer as NucleusRenderer, Triangle as NucleusTriangle,
+    hardware_ray_tracing_supported,
 };
 
 /// A perspective camera used to generate primary rays.

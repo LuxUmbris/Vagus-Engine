@@ -1,6 +1,23 @@
+//! Copyright © 2026 Vagus Engine Contributors
+//! The authors of this file (the "Software") are not reliable
+//! for any damages caused by the Software.
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//! NEITHER EXPRESS OR IMPLIED. EVERY COPY OF THE SOFTWARE MUST
+//! CONTAIN THIS TEXT. ANY MODIFICATIONS OF ANY KIND OF THE
+//! SOFTWARE MUST BE EXPLICITLY STATED.
+//!
+//! For further information, see:
+//! github.com/LuxUmbris/Vagus-Engine/LICENSE.
+//!
+//! Authors: Vincent Noll
+
 use vagus::math::Vec2;
 use vagus::render::{Color, NamedColor, Renderer};
 use vagus::window::Window;
+
+fn point(x: f32, y: f32) -> Vec2 {
+    Vec2 { x, y }
+}
 
 #[test]
 fn public_renderer_draws_and_presents_a_window_frame() {
@@ -9,34 +26,24 @@ fn public_renderer_draws_and_presents_a_window_frame() {
     let mut renderer = Renderer::new(&mut window).expect("initialize Vulkan for the window");
 
     renderer.clear(NamedColor::Black);
-    renderer.draw_dot(1, 1, NamedColor::White);
-    renderer.draw_line((2, 2), (12, 2), NamedColor::Red);
-    renderer.draw_triangle((10, 10), (20, 10), (15, 20), NamedColor::Green);
-    renderer.draw_triangle_outline((22, 10), (32, 10), (27, 20), Color::rgb(180, 40, 220));
-    renderer.draw_rectangle(2, 24, 12, 6, NamedColor::Cyan);
-    renderer.draw_rectangle_outline(16, 24, 12, 6, NamedColor::Orange);
-    renderer.draw_square(25, 2, 8, NamedColor::Blue);
-    renderer.draw_circle((45, 12), 6, NamedColor::Yellow);
-    renderer.draw_circle_outline((45, 30), 6, Color::rgb(220, 180, 20));
-    renderer.draw_dot_vec2(Vec2 { x: 2.5, y: 3.0 }, NamedColor::White);
-    renderer.draw_line_vec2(
-        Vec2 { x: 2.0, y: 34.0 },
-        Vec2 { x: 12.0, y: 34.0 },
-        NamedColor::Red,
-    );
-    renderer.draw_triangle_vec2(
-        Vec2 { x: 10.0, y: 36.0 },
-        Vec2 { x: 20.0, y: 36.0 },
-        Vec2 { x: 15.0, y: 46.0 },
+    renderer.draw_dot(point(1.0, 1.0), NamedColor::White);
+    renderer.draw_line(point(2.0, 2.0), point(12.0, 2.0), NamedColor::Red);
+    renderer.draw_triangle(
+        point(10.0, 10.0),
+        point(20.0, 10.0),
+        point(15.0, 20.0),
         NamedColor::Green,
     );
-    renderer.draw_triangle_outline_vec2(
-        Vec2 { x: 22.0, y: 36.0 },
-        Vec2 { x: 32.0, y: 36.0 },
-        Vec2 { x: 27.0, y: 46.0 },
-        NamedColor::Cyan,
+    renderer.draw_triangle_outline(
+        point(22.0, 10.0),
+        point(32.0, 10.0),
+        point(27.0, 20.0),
+        Color::rgb(180, 40, 220),
     );
-    renderer.draw_circle_vec2(Vec2 { x: 45.0, y: 44.0 }, 6, NamedColor::Yellow);
-    renderer.draw_circle_outline_vec2(Vec2 { x: 45.0, y: 60.0 }, 3, NamedColor::Orange);
+    renderer.draw_rectangle(point(2.0, 24.0), 12, 6, NamedColor::Cyan);
+    renderer.draw_rectangle_outline(point(16.0, 24.0), 12, 6, NamedColor::Orange);
+    renderer.draw_square(point(25.0, 2.0), 8, NamedColor::Blue);
+    renderer.draw_circle(point(45.0, 12.0), 6, NamedColor::Yellow);
+    renderer.draw_circle_outline(point(45.0, 30.0), 6, Color::rgb(220, 180, 20));
     renderer.present().expect("present a rendered frame");
 }

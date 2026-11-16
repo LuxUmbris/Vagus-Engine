@@ -1,3 +1,16 @@
+//! Copyright © 2026 Vagus Engine Contributors
+//! The authors of this file (the "Software") are not reliable
+//! for any damages caused by the Software.
+//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//! NEITHER EXPRESS OR IMPLIED. EVERY COPY OF THE SOFTWARE MUST
+//! CONTAIN THIS TEXT. ANY MODIFICATIONS OF ANY KIND OF THE
+//! SOFTWARE MUST BE EXPLICITLY STATED.
+//!
+//! For further information, see:
+//! github.com/LuxUmbris/Vagus-Engine/LICENSE.
+//!
+//! Authors: Vincent Noll
+
 use crate::api::math::Vec2;
 use crate::api::window::Window;
 
@@ -56,7 +69,7 @@ struct Canvas {
 }
 
 impl Canvas {
-    fn new(width: u32, height: u32) -> Result<Self, String> {
+    pub fn new(width: u32, height: u32) -> Result<Self, String> {
         let count = usize::try_from(width)
             .ok()
             .and_then(|width| usize::try_from(height).ok()?.checked_mul(width))
@@ -73,25 +86,26 @@ impl Canvas {
         })
     }
 
-    fn clear(&mut self, color: Color) {
+    pub fn clear(&mut self, color: Color) {
         self.pixels.fill(color);
     }
 
-    fn pixel(&self, x: u32, y: u32) -> Color {
+    #[allow(dead_code)]
+    pub fn pixel(&self, x: u32, y: u32) -> Color {
         self.pixels[(y * self.width + x) as usize]
     }
 
-    fn dot(&mut self, x: i32, y: i32, color: Color) {
+    fn dot_pixels(&mut self, x: i32, y: i32, color: Color) {
         self.set_pixel(x, y, color);
     }
 
-    fn dot_vec2(&mut self, point: Vec2, color: Color) {
+    fn dot(&mut self, point: Vec2, color: Color) {
         if let Some((x, y)) = pixel_point(point) {
-            self.dot(x, y, color);
+            self.dot_pixels(x, y, color);
         }
     }
 
-    fn line(&mut self, start: (i32, i32), end: (i32, i32), color: Color) {
+    fn line_pixels(&mut self, start: (i32, i32), end: (i32, i32), color: Color) {
         let Some(((mut x0, mut y0), (x1, y1))) = self.clip_line(start, end) else {
             return;
         };
@@ -117,18 +131,18 @@ impl Canvas {
         }
     }
 
-    fn line_vec2(&mut self, start: Vec2, end: Vec2, color: Color) {
+    fn line(&mut self, start: Vec2, end: Vec2, color: Color) {
         if let (Some(start), Some(end)) = (pixel_point(start), pixel_point(end)) {
-            self.line(start, end, color);
+            self.line_pixels(start, end, color);
         }
     }
 
-    fn triangle(&mut self, a: (i32, i32), b: (i32, i32), c: (i32, i32), color: Color) {
+    fn triangle_pixels(&mut self, a: (i32, i32), b: (i32, i32), c: (i32, i32), color: Color) {
         let area = edge(a, b, c.0 as i64, c.1 as i64);
         if area == 0 {
-            self.line(a, b, color);
-            self.line(b, c, color);
-            self.line(c, a, color);
+            self.line_pixels(a, b, color);
+            self.line_pixels(b, c, color);
+            self.line_pixels(c, a, color);
             return;
         }
         let min_x = a.0.min(b.0).min(c.0).max(0) as u32;
@@ -153,25 +167,31 @@ impl Canvas {
         }
     }
 
-    fn triangle_vec2(&mut self, a: Vec2, b: Vec2, c: Vec2, color: Color) {
+    fn triangle(&mut self, a: Vec2, b: Vec2, c: Vec2, color: Color) {
         if let (Some(a), Some(b), Some(c)) = (pixel_point(a), pixel_point(b), pixel_point(c)) {
-            self.triangle(a, b, c, color);
+            self.triangle_pixels(a, b, c, color);
         }
     }
 
-    fn triangle_outline(&mut self, a: (i32, i32), b: (i32, i32), c: (i32, i32), color: Color) {
-        self.line(a, b, color);
-        self.line(b, c, color);
-        self.line(c, a, color);
+    fn triangle_outline_pixels(
+        &mut self,
+        a: (i32, i32),
+        b: (i32, i32),
+        c: (i32, i32),
+        color: Color,
+    ) {
+        self.line_pixels(a, b, color);
+        self.line_pixels(b, c, color);
+        self.line_pixels(c, a, color);
     }
 
-    fn triangle_outline_vec2(&mut self, a: Vec2, b: Vec2, c: Vec2, color: Color) {
+    fn triangle_outline(&mut self, a: Vec2, b: Vec2, c: Vec2, color: Color) {
         if let (Some(a), Some(b), Some(c)) = (pixel_point(a), pixel_point(b), pixel_point(c)) {
-            self.triangle_outline(a, b, c, color);
+            self.triangle_outline_pixels(a, b, c, color);
         }
     }
 
-    fn rectangle(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
+    fn rectangle_pixels(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
         if width == 0 || height == 0 {
             return;
         }
@@ -186,7 +206,13 @@ impl Canvas {
         }
     }
 
-    fn rectangle_outline(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
+    fn rectangle(&mut self, position: Vec2, width: u32, height: u32, color: Color) {
+        if let Some((x, y)) = pixel_point(position) {
+            self.rectangle_pixels(x, y, width, height, color);
+        }
+    }
+
+    fn rectangle_outline_pixels(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
         if width == 0 || height == 0 {
             return;
         }
@@ -208,7 +234,13 @@ impl Canvas {
         }
     }
 
-    fn square(&mut self, x: i32, y: i32, size: u32, color: Color) {
+    fn rectangle_outline(&mut self, position: Vec2, width: u32, height: u32, color: Color) {
+        if let Some((x, y)) = pixel_point(position) {
+            self.rectangle_outline_pixels(x, y, width, height, color);
+        }
+    }
+
+    fn square_pixels(&mut self, x: i32, y: i32, size: u32, color: Color) {
         if size == 0 || self.width == 0 || self.height == 0 {
             return;
         }
@@ -223,7 +255,13 @@ impl Canvas {
         }
     }
 
-    fn circle(&mut self, center: (i32, i32), radius: u32, color: Color) {
+    fn square(&mut self, position: Vec2, size: u32, color: Color) {
+        if let Some((x, y)) = pixel_point(position) {
+            self.square_pixels(x, y, size, color);
+        }
+    }
+
+    fn circle_pixels(&mut self, center: (i32, i32), radius: u32, color: Color) {
         if self.width == 0 || self.height == 0 {
             return;
         }
@@ -245,13 +283,13 @@ impl Canvas {
         }
     }
 
-    fn circle_vec2(&mut self, center: Vec2, radius: u32, color: Color) {
+    pub fn circle(&mut self, center: Vec2, radius: u32, color: Color) {
         if let Some(center) = pixel_point(center) {
-            self.circle(center, radius, color);
+            self.circle_pixels(center, radius, color);
         }
     }
 
-    fn circle_outline(&mut self, center: (i32, i32), radius: u32, color: Color) {
+    fn circle_outline_pixels(&mut self, center: (i32, i32), radius: u32, color: Color) {
         if radius == 0 {
             self.set_pixel(center.0, center.1, color);
             return;
@@ -280,24 +318,28 @@ impl Canvas {
         }
     }
 
-    fn circle_outline_vec2(&mut self, center: Vec2, radius: u32, color: Color) {
+    fn circle_outline(&mut self, center: Vec2, radius: u32, color: Color) {
         if let Some(center) = pixel_point(center) {
-            self.circle_outline(center, radius, color);
+            self.circle_outline_pixels(center, radius, color);
         }
     }
 
-    fn set_pixel(&mut self, x: i32, y: i32, color: Color) {
+    pub fn set_pixel(&mut self, x: i32, y: i32, color: Color) {
         self.set_pixel_i64(x as i64, y as i64, color);
     }
 
-    fn set_pixel_i64(&mut self, x: i64, y: i64, color: Color) {
+    pub fn set_pixel_i64(&mut self, x: i64, y: i64, color: Color) {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
             return;
         }
         self.pixels[y as usize * self.width as usize + x as usize] = color;
     }
 
-    fn clip_line(&self, start: (i32, i32), end: (i32, i32)) -> Option<((i32, i32), (i32, i32))> {
+    pub fn clip_line(
+        &self,
+        start: (i32, i32),
+        end: (i32, i32),
+    ) -> Option<((i32, i32), (i32, i32))> {
         if self.width == 0 || self.height == 0 {
             return None;
         }
@@ -396,109 +438,59 @@ impl<'window> Renderer<'window> {
         self.canvas.clear(color.into());
     }
 
-    pub fn draw_dot(&mut self, x: i32, y: i32, color: impl Into<Color>) {
-        self.canvas.dot(x, y, color.into());
-    }
-
     /// Draws a point at rounded `Vec2` coordinates; invalid coordinates are ignored.
-    pub fn draw_dot_vec2(&mut self, point: Vec2, color: impl Into<Color>) {
-        self.canvas.dot_vec2(point, color.into());
-    }
-
-    pub fn draw_line(&mut self, start: (i32, i32), end: (i32, i32), color: impl Into<Color>) {
-        self.canvas.line(start, end, color.into());
+    pub fn draw_dot(&mut self, point: Vec2, color: impl Into<Color>) {
+        self.canvas.dot(point, color.into());
     }
 
     /// Draws between rounded `Vec2` endpoints; invalid endpoints are ignored.
-    pub fn draw_line_vec2(&mut self, start: Vec2, end: Vec2, color: impl Into<Color>) {
-        self.canvas.line_vec2(start, end, color.into());
-    }
-
-    pub fn draw_triangle(
-        &mut self,
-        a: (i32, i32),
-        b: (i32, i32),
-        c: (i32, i32),
-        color: impl Into<Color>,
-    ) {
-        self.canvas.triangle(a, b, c, color.into());
+    pub fn draw_line(&mut self, start: Vec2, end: Vec2, color: impl Into<Color>) {
+        self.canvas.line(start, end, color.into());
     }
 
     /// Draws a filled triangle from rounded `Vec2` vertices.
-    pub fn draw_triangle_vec2(&mut self, a: Vec2, b: Vec2, c: Vec2, color: impl Into<Color>) {
-        self.canvas.triangle_vec2(a, b, c, color.into());
-    }
-
-    pub fn draw_triangle_outline(
-        &mut self,
-        a: (i32, i32),
-        b: (i32, i32),
-        c: (i32, i32),
-        color: impl Into<Color>,
-    ) {
-        self.canvas.triangle_outline(a, b, c, color.into());
+    pub fn draw_triangle(&mut self, a: Vec2, b: Vec2, c: Vec2, color: impl Into<Color>) {
+        self.canvas.triangle(a, b, c, color.into());
     }
 
     /// Draws a triangle outline from rounded `Vec2` vertices.
-    pub fn draw_triangle_outline_vec2(
-        &mut self,
-        a: Vec2,
-        b: Vec2,
-        c: Vec2,
-        color: impl Into<Color>,
-    ) {
-        self.canvas.triangle_outline_vec2(a, b, c, color.into());
+    pub fn draw_triangle_outline(&mut self, a: Vec2, b: Vec2, c: Vec2, color: impl Into<Color>) {
+        self.canvas.triangle_outline(a, b, c, color.into());
     }
 
     pub fn draw_rectangle(
         &mut self,
-        x: i32,
-        y: i32,
+        position: Vec2,
         width: u32,
         height: u32,
         color: impl Into<Color>,
     ) {
-        self.canvas.rectangle(x, y, width, height, color.into());
+        self.canvas.rectangle(position, width, height, color.into());
     }
 
     pub fn draw_rectangle_outline(
         &mut self,
-        x: i32,
-        y: i32,
+        position: Vec2,
         width: u32,
         height: u32,
         color: impl Into<Color>,
     ) {
         self.canvas
-            .rectangle_outline(x, y, width, height, color.into());
+            .rectangle_outline(position, width, height, color.into());
     }
 
-    pub fn draw_square(&mut self, x: i32, y: i32, size: u32, color: impl Into<Color>) {
-        self.canvas.square(x, y, size, color.into());
-    }
-
-    pub fn draw_circle(&mut self, center: (i32, i32), radius: u32, color: impl Into<Color>) {
-        self.canvas.circle(center, radius, color.into());
+    pub fn draw_square(&mut self, position: Vec2, size: u32, color: impl Into<Color>) {
+        self.canvas.square(position, size, color.into());
     }
 
     /// Draws a circle at a rounded `Vec2` center.
-    pub fn draw_circle_vec2(&mut self, center: Vec2, radius: u32, color: impl Into<Color>) {
-        self.canvas.circle_vec2(center, radius, color.into());
-    }
-
-    pub fn draw_circle_outline(
-        &mut self,
-        center: (i32, i32),
-        radius: u32,
-        color: impl Into<Color>,
-    ) {
-        self.canvas.circle_outline(center, radius, color.into());
+    pub fn draw_circle(&mut self, center: Vec2, radius: u32, color: impl Into<Color>) {
+        self.canvas.circle(center, radius, color.into());
     }
 
     /// Draws a circle outline at a rounded `Vec2` center.
-    pub fn draw_circle_outline_vec2(&mut self, center: Vec2, radius: u32, color: impl Into<Color>) {
-        self.canvas
-            .circle_outline_vec2(center, radius, color.into());
+    pub fn draw_circle_outline(&mut self, center: Vec2, radius: u32, color: impl Into<Color>) {
+        self.canvas.circle_outline(center, radius, color.into());
     }
 
     pub fn present(&mut self) -> Result<(), String> {
@@ -534,11 +526,16 @@ mod tests {
         let mut canvas = Canvas::new(12, 12).unwrap();
         let red = Color::from(NamedColor::Red);
         canvas.clear(Color(0, 0, 0));
-        canvas.dot(0, 0, red);
-        canvas.line((1, 2), (5, 2), red);
-        canvas.triangle((1, 4), (5, 4), (3, 8), red);
-        canvas.square(7, 1, 3, red);
-        canvas.circle((8, 8), 2, red);
+        canvas.dot(Vec2 { x: 0.0, y: 0.0 }, red);
+        canvas.line(Vec2 { x: 1.0, y: 2.0 }, Vec2 { x: 5.0, y: 2.0 }, red);
+        canvas.triangle(
+            Vec2 { x: 1.0, y: 4.0 },
+            Vec2 { x: 5.0, y: 4.0 },
+            Vec2 { x: 3.0, y: 8.0 },
+            red,
+        );
+        canvas.square(Vec2 { x: 7.0, y: 1.0 }, 3, red);
+        canvas.circle(Vec2 { x: 8.0, y: 8.0 }, 2, red);
 
         assert_eq!(canvas.pixel(0, 0), red);
         assert_eq!(canvas.pixel(3, 2), red);
@@ -546,24 +543,24 @@ mod tests {
         assert_eq!(canvas.pixel(8, 2), red);
         assert_eq!(canvas.pixel(8, 8), red);
         assert_eq!(canvas.pixel(11, 11), Color(0, 0, 0));
-        canvas.dot(-1, 0, red);
-        canvas.dot(12, 0, red);
+        canvas.dot(Vec2 { x: -1.0, y: 0.0 }, red);
+        canvas.dot(Vec2 { x: 12.0, y: 0.0 }, red);
     }
 
     #[test]
     fn vec2_coordinates_round_to_pixels_and_ignore_invalid_points() {
         let mut canvas = Canvas::new(6, 6).unwrap();
         let red = Color::from(NamedColor::Red);
-        canvas.dot_vec2(Vec2 { x: 1.6, y: 2.2 }, red);
-        canvas.line_vec2(Vec2 { x: 0.0, y: 4.0 }, Vec2 { x: 2.9, y: 4.0 }, red);
-        canvas.dot_vec2(
+        canvas.dot(Vec2 { x: 1.6, y: 2.2 }, red);
+        canvas.line(Vec2 { x: 0.0, y: 4.0 }, Vec2 { x: 2.9, y: 4.0 }, red);
+        canvas.dot(
             Vec2 {
                 x: f32::NAN,
                 y: 0.0,
             },
             red,
         );
-        canvas.dot_vec2(
+        canvas.dot(
             Vec2 {
                 x: i32::MAX as f32,
                 y: 0.0,
@@ -584,8 +581,8 @@ mod tests {
         let outline = Color(200, 40, 10);
         canvas.clear(background);
 
-        canvas.rectangle(-1, 1, 4, 3, fill);
-        canvas.rectangle_outline(4, 1, 4, 3, outline);
+        canvas.rectangle(Vec2 { x: -1.0, y: 1.0 }, 4, 3, fill);
+        canvas.rectangle_outline(Vec2 { x: 4.0, y: 1.0 }, 4, 3, outline);
 
         assert_eq!(canvas.pixel(0, 1), fill);
         assert_eq!(canvas.pixel(2, 2), fill);
@@ -603,8 +600,13 @@ mod tests {
         let triangle = Color(80, 30, 200);
         canvas.clear(background);
 
-        canvas.circle_outline((2, 2), 2, circle);
-        canvas.triangle_outline((5, 1), (9, 1), (7, 5), triangle);
+        canvas.circle_outline(Vec2 { x: 2.0, y: 2.0 }, 2, circle);
+        canvas.triangle_outline(
+            Vec2 { x: 5.0, y: 1.0 },
+            Vec2 { x: 9.0, y: 1.0 },
+            Vec2 { x: 7.0, y: 5.0 },
+            triangle,
+        );
 
         assert_eq!(canvas.pixel(2, 0), circle);
         assert_eq!(canvas.pixel(2, 2), background);
