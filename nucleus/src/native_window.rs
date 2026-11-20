@@ -118,6 +118,29 @@ impl WindowHandle {
         }
     }
 
+    pub fn set_surrounding_text(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        anchor: usize,
+    ) -> Result<(), String> {
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            WindowBackend::LinuxX11(_) => {
+                Err("surrounding-text updates require Wayland text-input-v3".into())
+            }
+            #[cfg(target_os = "linux")]
+            WindowBackend::LinuxWayland(window) => {
+                window.set_surrounding_text(text, cursor, anchor)
+            }
+            #[cfg(target_os = "windows")]
+            WindowBackend::Windows(_) => {
+                let _ = (text, cursor, anchor);
+                Err("surrounding-text updates require Wayland text-input-v3".into())
+            }
+        }
+    }
+
     pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), String> {
         match &mut self.backend {
             #[cfg(target_os = "linux")]

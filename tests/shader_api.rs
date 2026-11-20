@@ -11,7 +11,7 @@
 //!
 //! Authors: Vincent Noll
 
-use vagus::shader::{Shader, ShaderDevice, ShaderStage};
+use vagus::shader::{Shader, ShaderStage};
 
 fn minimal_vertex_spirv() -> Vec<u32> {
     vec![
@@ -70,19 +70,4 @@ fn shader_rejects_malformed_spirv_and_entry_points() {
     assert!(Shader::from_spirv_bytes(ShaderStage::Vertex, &[1, 2, 3], "main").is_err());
     assert!(Shader::from_spirv(ShaderStage::Vertex, &minimal_vertex_spirv(), "missing").is_err());
     assert!(Shader::from_spirv(ShaderStage::Fragment, &minimal_vertex_spirv(), "main").is_err());
-}
-
-#[test]
-fn native_shader_device_creates_a_shader_module_when_available() {
-    let shader = Shader::from_spirv(ShaderStage::Vertex, &minimal_vertex_spirv(), "main").unwrap();
-    let device = match ShaderDevice::new() {
-        Ok(device) => device,
-        Err(error) => {
-            eprintln!("skipping Vulkan shader-module creation: {error}");
-            return;
-        }
-    };
-    let module = device.load(&shader).expect("create Vulkan shader module");
-    assert_eq!(module.stage(), ShaderStage::Vertex);
-    assert_eq!(module.entry_point(), "main");
 }

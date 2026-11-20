@@ -1,0 +1,28 @@
+name: Windows allocator backend
+
+on:
+  push:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "vagus_essential/**"
+      - ".github/workflows/windows-allocator.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "vagus_essential/**"
+      - ".github/workflows/windows-allocator.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  allocator-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run allocator tests on Windows
+        run: cargo test -p vagus_essential --lib -- --test-threads=1

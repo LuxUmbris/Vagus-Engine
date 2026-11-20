@@ -10,7 +10,7 @@ fn rgba8_texture_validation_checks_nonzero_extent_and_exact_size() {
 
 #[test]
 fn texture_device_uploads_and_owns_a_vulkan_image_when_available() {
-    let device = match TextureDevice::new() {
+    let device = match TextureDevice::new_standalone() {
         Ok(device) => device,
         Err(error) => {
             eprintln!("skipping Vulkan texture upload: {error}");

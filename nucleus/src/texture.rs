@@ -11,8 +11,13 @@
 //!
 //! Authors: Vincent Noll
 
+use crate::vulkan::SharedDevice;
 use ash::{Device, Entry, Instance, vk};
-use std::{ffi::CString, ptr, sync::Arc};
+use std::{
+    ffi::CString,
+    ptr,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 pub fn validate_rgba8_texture_data(width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
     if width == 0 || height == 0 {
@@ -36,22 +41,97 @@ pub fn validate_rgba8_texture_data(width: u32, height: u32, pixels: &[u8]) -> Re
     Ok(())
 }
 
+enum DeviceOwner {
+    Owned {
+        _entry: Entry,
+        instance: Instance,
+        physical_device: vk::PhysicalDevice,
+        device: Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+    },
+    Shared {
+        shared: Arc<SharedDevice>,
+        command_pool: vk::CommandPool,
+    },
+}
+
 struct DeviceInner {
-    _entry: Entry,
-    instance: Instance,
-    physical_device: vk::PhysicalDevice,
-    device: Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
+    owner: DeviceOwner,
+    owned_queue_access: Mutex<()>,
+}
+
+impl DeviceInner {
+    fn lock_queue(&self) -> MutexGuard<'_, ()> {
+        let queue_access = match &self.owner {
+            DeviceOwner::Owned { .. } => &self.owned_queue_access,
+            DeviceOwner::Shared { shared, .. } => &shared.queue_access,
+        };
+        queue_access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn instance(&self) -> &Instance {
+        match &self.owner {
+            DeviceOwner::Owned { instance, .. } => instance,
+            DeviceOwner::Shared { shared, .. } => &shared.instance,
+        }
+    }
+
+    fn physical_device(&self) -> vk::PhysicalDevice {
+        match &self.owner {
+            DeviceOwner::Owned {
+                physical_device, ..
+            } => *physical_device,
+            DeviceOwner::Shared { shared, .. } => shared.physical_device,
+        }
+    }
+
+    fn device(&self) -> &Device {
+        match &self.owner {
+            DeviceOwner::Owned { device, .. } => device,
+            DeviceOwner::Shared { shared, .. } => &shared.device,
+        }
+    }
+
+    fn queue(&self) -> vk::Queue {
+        match &self.owner {
+            DeviceOwner::Owned { queue, .. } => *queue,
+            DeviceOwner::Shared { shared, .. } => shared.queue,
+        }
+    }
+
+    fn command_pool(&self) -> vk::CommandPool {
+        match &self.owner {
+            DeviceOwner::Owned { command_pool, .. } | DeviceOwner::Shared { command_pool, .. } => {
+                *command_pool
+            }
+        }
+    }
 }
 
 impl Drop for DeviceInner {
     fn drop(&mut self) {
+        let _queue_guard = self.lock_queue();
         unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_command_pool(self.command_pool, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            match &self.owner {
+                DeviceOwner::Owned {
+                    instance,
+                    device,
+                    command_pool,
+                    ..
+                } => {
+                    let _ = device.device_wait_idle();
+                    device.destroy_command_pool(*command_pool, None);
+                    device.destroy_device(None);
+                    instance.destroy_instance(None);
+                }
+                DeviceOwner::Shared {
+                    shared,
+                    command_pool,
+                } => shared.device.destroy_command_pool(*command_pool, None),
+            }
         }
     }
 }
@@ -61,7 +141,12 @@ pub struct TextureDevice {
     inner: Arc<DeviceInner>,
 }
 
+#[derive(Clone)]
 pub struct GpuTexture {
+    resource: Arc<GpuTextureResource>,
+}
+
+struct GpuTextureResource {
     inner: Arc<DeviceInner>,
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -72,7 +157,9 @@ pub struct GpuTexture {
 }
 
 impl TextureDevice {
-    pub fn new() -> Result<Self, String> {
+    /// Creates a standalone Vulkan device for texture uploads.
+    /// Use `Renderer::texture_device` to share the presentation device.
+    pub fn new_standalone() -> Result<Self, String> {
         let entry =
             unsafe { Entry::load() }.map_err(|error| format!("failed to load Vulkan: {error}"))?;
         let app_name = CString::new("Vagus texture device").expect("static string has no NUL");
@@ -135,12 +222,34 @@ impl TextureDevice {
 
         Ok(Self {
             inner: Arc::new(DeviceInner {
-                _entry: entry,
-                instance,
-                physical_device,
-                device,
-                queue,
-                command_pool,
+                owner: DeviceOwner::Owned {
+                    _entry: entry,
+                    instance,
+                    physical_device,
+                    device,
+                    queue,
+                    command_pool,
+                },
+                owned_queue_access: Mutex::new(()),
+            }),
+        })
+    }
+
+    pub(crate) fn from_shared(shared: Arc<SharedDevice>) -> Result<Self, String> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(shared.queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let command_pool =
+            unsafe { shared.device.create_command_pool(&pool_info, None) }.map_err(|error| {
+                format!("failed to create shared Vulkan texture command pool: {error}")
+            })?;
+        Ok(Self {
+            inner: Arc::new(DeviceInner {
+                owner: DeviceOwner::Shared {
+                    shared,
+                    command_pool,
+                },
+                owned_queue_access: Mutex::new(()),
             }),
         })
     }
@@ -156,7 +265,7 @@ impl TextureDevice {
         let staging = StagingBuffer::new(Arc::clone(&self.inner), byte_len)?;
         staging.write(pixels)?;
 
-        let device = &self.inner.device;
+        let device = self.inner.device();
         let extent = vk::Extent3D {
             width,
             height,
@@ -175,7 +284,7 @@ impl TextureDevice {
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&image_info, None) }
             .map_err(|error| format!("failed to create Vulkan texture image: {error}"))?;
-        let mut texture = GpuTexture {
+        let mut texture = GpuTextureResource {
             inner: Arc::clone(&self.inner),
             image,
             memory: vk::DeviceMemory::null(),
@@ -219,24 +328,45 @@ impl TextureDevice {
             .map_err(|error| format!("failed to create Vulkan texture sampler: {error}"))?;
 
         upload_image(&self.inner, &staging, &texture)?;
-        Ok(texture)
+        Ok(GpuTexture {
+            resource: Arc::new(texture),
+        })
     }
 }
 
 impl GpuTexture {
     pub fn width(&self) -> u32 {
-        self.width
+        self.resource.width
     }
 
     pub fn height(&self) -> u32 {
-        self.height
+        self.resource.height
+    }
+
+    pub(crate) fn image_view(&self) -> vk::ImageView {
+        self.resource.view
+    }
+
+    pub(crate) fn sampler(&self) -> vk::Sampler {
+        self.resource.sampler
+    }
+
+    pub(crate) fn shares_resource(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.resource, &other.resource)
+    }
+
+    pub(crate) fn is_on_shared_device(&self, shared: &Arc<SharedDevice>) -> bool {
+        matches!(
+            &self.resource.inner.owner,
+            DeviceOwner::Shared { shared: owner, .. } if Arc::ptr_eq(owner, shared)
+        )
     }
 }
 
-impl Drop for GpuTexture {
+impl Drop for GpuTextureResource {
     fn drop(&mut self) {
         unsafe {
-            let device = &self.inner.device;
+            let device = self.inner.device();
             if self.sampler != vk::Sampler::null() {
                 device.destroy_sampler(self.sampler, None);
             }
@@ -263,7 +393,7 @@ struct StagingBuffer {
 
 impl StagingBuffer {
     fn new(inner: Arc<DeviceInner>, size: vk::DeviceSize) -> Result<Self, String> {
-        let device = &inner.device;
+        let device = inner.device();
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -285,8 +415,8 @@ impl StagingBuffer {
         };
         let properties = unsafe {
             inner
-                .instance
-                .get_physical_device_memory_properties(inner.physical_device)
+                .instance()
+                .get_physical_device_memory_properties(inner.physical_device())
         };
         let host_coherent = properties.memory_types[memory_type as usize]
             .property_flags
@@ -318,7 +448,7 @@ impl StagingBuffer {
     }
 
     fn write(&self, pixels: &[u8]) -> Result<(), String> {
-        let device = &self.inner.device;
+        let device = self.inner.device();
         let mapped =
             unsafe { device.map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty()) }
                 .map_err(|error| format!("failed to map Vulkan staging memory: {error}"))?;
@@ -343,8 +473,8 @@ impl StagingBuffer {
 impl Drop for StagingBuffer {
     fn drop(&mut self) {
         unsafe {
-            self.inner.device.destroy_buffer(self.buffer, None);
-            self.inner.device.free_memory(self.memory, None);
+            self.inner.device().destroy_buffer(self.buffer, None);
+            self.inner.device().free_memory(self.memory, None);
         }
     }
 }
@@ -358,8 +488,8 @@ impl Drop for CommandBufferGuard {
     fn drop(&mut self) {
         unsafe {
             self.inner
-                .device
-                .free_command_buffers(self.inner.command_pool, &[self.command_buffer]);
+                .device()
+                .free_command_buffers(self.inner.command_pool(), &[self.command_buffer]);
         }
     }
 }
@@ -367,11 +497,11 @@ impl Drop for CommandBufferGuard {
 fn upload_image(
     inner: &Arc<DeviceInner>,
     staging: &StagingBuffer,
-    texture: &GpuTexture,
+    texture: &GpuTextureResource,
 ) -> Result<(), String> {
-    let device = &inner.device;
+    let device = inner.device();
     let allocate = vk::CommandBufferAllocateInfo::default()
-        .command_pool(inner.command_pool)
+        .command_pool(inner.command_pool())
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
     let command_buffer = unsafe { device.allocate_command_buffers(&allocate) }
@@ -464,9 +594,10 @@ fn upload_image(
         .map_err(|error| format!("failed to end texture upload command buffer: {error}"))?;
     let commands = [command.command_buffer];
     let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-    unsafe { device.queue_submit(inner.queue, &submits, vk::Fence::null()) }
+    let _queue_guard = inner.lock_queue();
+    unsafe { device.queue_submit(inner.queue(), &submits, vk::Fence::null()) }
         .map_err(|error| format!("failed to submit texture upload: {error}"))?;
-    unsafe { device.queue_wait_idle(inner.queue) }
+    unsafe { device.queue_wait_idle(inner.queue()) }
         .map_err(|error| format!("failed waiting for texture upload: {error}"))?;
     Ok(())
 }
@@ -488,8 +619,8 @@ fn find_memory_type(
 ) -> Result<u32, String> {
     let properties = unsafe {
         inner
-            .instance
-            .get_physical_device_memory_properties(inner.physical_device)
+            .instance()
+            .get_physical_device_memory_properties(inner.physical_device())
     };
     let mut fallback = None;
     for index in 0..properties.memory_type_count {

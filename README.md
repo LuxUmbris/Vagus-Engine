@@ -33,7 +33,7 @@ The `vagus` crate re-exports its API modules, including `audio`, `ecs`, `event`,
 
 ## Build and test
 
-You’ll need a Rust toolchain and Cargo with support for Rust edition 2024. From the repository root:
+You’ll need a Rust toolchain and Cargo with support for Rust edition 2024. Linux X11 builds also require the XInput2 development library (`libXi`). Run from the repository root:
 
 ```sh
 cargo build -p vagus

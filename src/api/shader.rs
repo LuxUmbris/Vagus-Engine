@@ -73,9 +73,11 @@ impl Shader {
     }
 }
 
-/// Owns a Vulkan device used to load shader modules.
+/// Loads shader modules on a renderer's shared Vulkan device.
 ///
-/// This API accepts precompiled SPIR-V; it does not compile GLSL/HLSL or build pipelines.
+/// Obtain this handle from `Renderer::shader_device`. This API accepts precompiled SPIR-V; it does
+/// not compile GLSL/HLSL. Loaded vertex and fragment modules can be installed with the corresponding
+/// renderer methods.
 #[derive(Clone)]
 pub struct ShaderDevice {
     inner: nucleus::ShaderDevice,
@@ -85,13 +87,12 @@ pub struct ShaderModule {
     _inner: nucleus::ShaderModule,
     stage: ShaderStage,
     entry_point: String,
+    words: Vec<u32>,
 }
 
 impl ShaderDevice {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self {
-            inner: nucleus::ShaderDevice::new()?,
-        })
+    pub(crate) fn from_shared(inner: nucleus::ShaderDevice) -> Self {
+        Self { inner }
     }
 
     pub fn load(&self, shader: &Shader) -> Result<ShaderModule, String> {
@@ -99,6 +100,7 @@ impl ShaderDevice {
             _inner: self.inner.create_shader_module(shader.words())?,
             stage: shader.stage(),
             entry_point: shader.entry_point().to_owned(),
+            words: shader.words().to_vec(),
         })
     }
 }
@@ -110,6 +112,14 @@ impl ShaderModule {
 
     pub fn entry_point(&self) -> &str {
         &self.entry_point
+    }
+
+    pub(crate) fn belongs_to_device(&self, device: &nucleus::ShaderDevice) -> bool {
+        self._inner.belongs_to_device(device)
+    }
+
+    pub(crate) fn words(&self) -> &[u32] {
+        &self.words
     }
 }
 

@@ -21,8 +21,11 @@ layout(push_constant) uniform Camera {
     vec4 right;
     vec4 up;
     float tan_half_fov;
+    float near_plane;
+    float far_plane;
     uint width;
     uint height;
+    uint padding;
 } camera;
 layout(location = 0) rayPayloadEXT vec3 color;
 void main() {
@@ -30,8 +33,9 @@ void main() {
     vec2 ndc = ((vec2(pixel) + vec2(0.5)) / vec2(camera.width, camera.height)) * 2.0 - 1.0;
     ndc.y = -ndc.y;
     vec3 direction = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * camera.tan_half_fov * float(camera.width) / float(camera.height) + camera.up.xyz * ndc.y * camera.tan_half_fov);
+    float forward_component = dot(direction, camera.forward.xyz);
     color = vec3(0.02, 0.04, 0.12);
-    traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, camera.origin.xyz, 0.001, direction, 10000.0, 0);
+    traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, camera.origin.xyz, camera.near_plane / forward_component, direction, camera.far_plane / forward_component, 0);
     uvec3 rgb = uvec3(clamp(color, 0.0, 1.0) * 255.0 + 0.5);
     pixels.rgba[pixel.y * camera.width + pixel.x] = rgb.r | (rgb.g << 8) | (rgb.b << 16) | 0xff000000;
 }

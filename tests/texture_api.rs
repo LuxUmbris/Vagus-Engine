@@ -24,6 +24,42 @@ fn rgba8_texture_validates_and_preserves_pixels() {
 }
 
 #[test]
+fn texture_opacity_metadata_matches_every_alpha_channel() {
+    let opaque = Texture::from_rgba8(2, 1, &[1, 2, 3, 255, 4, 5, 6, 255]).unwrap();
+    let transparent = Texture::from_rgba8(2, 1, &[1, 2, 3, 255, 4, 5, 6, 254]).unwrap();
+    let invisible = Texture::from_rgba8(1, 1, &[1, 2, 3, 0]).unwrap();
+
+    assert!(opaque.is_fully_opaque());
+    assert!(!transparent.is_fully_opaque());
+    assert!(!invisible.is_fully_opaque());
+    assert!(opaque.clone().is_fully_opaque());
+}
+
+#[test]
+fn cloning_texture_shares_immutable_pixel_storage() {
+    let texture = Texture::from_rgba8(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    let clone = texture.clone();
+
+    assert!(std::ptr::eq(
+        texture.rgba8().as_ptr(),
+        clone.rgba8().as_ptr()
+    ));
+    assert_eq!(texture, clone);
+}
+
+#[test]
+fn equal_texture_contents_share_hash_map_cache_entries() {
+    let first = Texture::from_rgba8(1, 1, &[10, 20, 30, 40]).unwrap();
+    let second = Texture::from_rgba8(1, 1, &[10, 20, 30, 40]).unwrap();
+    let mut cache = std::collections::HashMap::new();
+
+    cache.insert(first, ());
+    cache.insert(second, ());
+
+    assert_eq!(cache.len(), 1);
+}
+
+#[test]
 fn rgba8_texture_rejects_invalid_dimensions_and_payload_lengths() {
     assert!(Texture::from_rgba8(0, 1, &[]).is_err());
     assert!(Texture::from_rgba8(1, 1, &[0, 0, 0]).is_err());
@@ -32,7 +68,7 @@ fn rgba8_texture_rejects_invalid_dimensions_and_payload_lengths() {
 
 #[test]
 fn texture_device_uploads_a_validated_rgba8_image_when_vulkan_is_available() {
-    let device = match TextureDevice::new() {
+    let device = match TextureDevice::new_standalone() {
         Ok(device) => device,
         Err(error) => {
             eprintln!("skipping Vulkan texture upload: {error}");

@@ -11,8 +11,13 @@
 //!
 //! Authors: Vincent Noll
 
+use crate::vulkan::SharedDevice;
 use ash::{Device, Entry, Instance, vk};
-use std::{ffi::CString, ptr};
+use std::{
+    ffi::CString,
+    ptr,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Triangle {
@@ -24,6 +29,8 @@ pub struct Camera {
     pub target: [f32; 3],
     pub up: [f32; 3],
     pub vertical_fov_degrees: f32,
+    pub near_plane: f32,
+    pub far_plane: f32,
 }
 impl Default for Camera {
     fn default() -> Self {
@@ -32,6 +39,8 @@ impl Default for Camera {
             target: [0.0, 0.0, 0.0],
             up: [0.0, 1.0, 0.0],
             vertical_fov_degrees: 60.0,
+            near_plane: 0.01,
+            far_plane: 10_000.0,
         }
     }
 }
@@ -92,10 +101,10 @@ pub fn hardware_ray_tracing_supported() -> bool {
 }
 
 pub struct RtxRenderer {
-    _entry: Entry,
-    instance: Instance,
+    _shared: Arc<SharedDevice>,
+    instance: Arc<Instance>,
     physical: vk::PhysicalDevice,
-    device: Device,
+    device: Arc<Device>,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     rt: ash::khr::ray_tracing_pipeline::Device,
@@ -119,7 +128,9 @@ pub struct RtxRenderer {
     pipeline: vk::Pipeline,
 }
 impl RtxRenderer {
-    pub fn new(width: u32, height: u32) -> Result<Self, String> {
+    /// Creates a standalone Vulkan device and offscreen ray-tracing target.
+    /// Use `Renderer::rtx_renderer` to share the presentation device.
+    pub fn new_standalone(width: u32, height: u32) -> Result<Self, String> {
         if width == 0 || height == 0 {
             return Err("ray tracing target dimensions must be non-zero".into());
         }
@@ -235,11 +246,21 @@ impl RtxRenderer {
         };
         let rt = ash::khr::ray_tracing_pipeline::Device::new(&instance, &device);
         let as_loader = ash::khr::acceleration_structure::Device::new(&instance, &device);
+        let shared = Arc::new(SharedDevice {
+            _entry: Arc::new(entry),
+            instance: Arc::new(instance),
+            device: Arc::new(device),
+            queue,
+            physical_device: p,
+            queue_family: fam,
+            ray_tracing_supported: true,
+            queue_access: std::sync::Mutex::new(()),
+        });
         let mut s = Self {
-            _entry: entry,
-            instance,
+            _shared: Arc::clone(&shared),
+            instance: Arc::clone(&shared.instance),
             physical: p,
-            device,
+            device: Arc::clone(&shared.device),
             queue,
             command_pool: cp,
             rt,
@@ -264,6 +285,65 @@ impl RtxRenderer {
         };
         s.initialize(pixels)?;
         Ok(s)
+    }
+    pub(crate) fn from_shared(
+        shared: Arc<SharedDevice>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        if width == 0 || height == 0 {
+            return Err("ray tracing target dimensions must be non-zero".into());
+        }
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .filter(|n| *n <= u32::MAX as usize / 4)
+            .ok_or("ray tracing target is too large")?;
+        if !shared.ray_tracing_supported {
+            return Err("the presentation device was created without ray-tracing support".into());
+        }
+
+        let device = &shared.device;
+        let command_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(shared.queue_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(|error| format!("creating ray tracing command pool failed: {error:?}"))?;
+        let queue = shared.queue;
+        let rt = ash::khr::ray_tracing_pipeline::Device::new(&shared.instance, device);
+        let as_loader = ash::khr::acceleration_structure::Device::new(&shared.instance, device);
+        let mut renderer = Self {
+            instance: Arc::clone(&shared.instance),
+            device: Arc::clone(&shared.device),
+            physical: shared.physical_device,
+            _shared: shared,
+            queue,
+            command_pool,
+            rt,
+            as_loader,
+            width,
+            height,
+            output: Buffer::default(),
+            vertices: Buffer::default(),
+            blas_buffer: Buffer::default(),
+            blas: vk::AccelerationStructureKHR::null(),
+            instances: Buffer::default(),
+            tlas_buffer: Buffer::default(),
+            tlas: vk::AccelerationStructureKHR::null(),
+            scratch: Buffer::default(),
+            sbt: Buffer::default(),
+            sbt_offset: 0,
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_layout: vk::DescriptorSetLayout::null(),
+            descriptor_set: vk::DescriptorSet::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+        };
+        renderer.initialize(pixels)?;
+        Ok(renderer)
     }
     fn initialize(&mut self, pixels: usize) -> Result<(), String> {
         self.output = self.create_buffer(
@@ -331,15 +411,24 @@ impl RtxRenderer {
         }
         .map_err(|e| format!("creating ray tracing pipeline layout failed: {e:?}"))?;
 
-        let raygen = shader_module(&self.device, include_bytes!("shaders/spv/raygen.spv"))?;
-        let miss = match shader_module(&self.device, include_bytes!("shaders/spv/miss.spv")) {
+        let raygen = shader_module(
+            &self.device,
+            include_bytes!(concat!(env!("OUT_DIR"), "/raygen.spv")),
+        )?;
+        let miss = match shader_module(
+            &self.device,
+            include_bytes!(concat!(env!("OUT_DIR"), "/miss.spv")),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { self.device.destroy_shader_module(raygen, None) };
                 return Err(e);
             }
         };
-        let hit = match shader_module(&self.device, include_bytes!("shaders/spv/hit.spv")) {
+        let hit = match shader_module(
+            &self.device,
+            include_bytes!(concat!(env!("OUT_DIR"), "/hit.spv")),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe {
@@ -540,8 +629,10 @@ impl RtxRenderer {
 }
 impl Drop for RtxRenderer {
     fn drop(&mut self) {
+        let queue_guard = self._shared.lock_queue();
         unsafe {
             let _ = self.device.device_wait_idle();
+            drop(queue_guard);
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None)
             }
@@ -581,8 +672,6 @@ impl Drop for RtxRenderer {
             if self.command_pool != vk::CommandPool::null() {
                 self.device.destroy_command_pool(self.command_pool, None)
             }
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None)
         }
     }
 }
@@ -595,6 +684,8 @@ struct CameraPush {
     right: [f32; 4],
     up: [f32; 4],
     tan_half_fov: f32,
+    near_plane: f32,
+    far_plane: f32,
     width: u32,
     height: u32,
     _padding: u32,
@@ -641,6 +732,13 @@ fn trace_scene(
     {
         return Err("camera vertical field of view must be between 0 and 179 degrees".into());
     }
+    if !camera.near_plane.is_finite()
+        || !camera.far_plane.is_finite()
+        || camera.near_plane <= 0.0
+        || camera.far_plane <= camera.near_plane
+    {
+        return Err("camera far plane must be greater than a positive near plane".into());
+    }
     if triangles
         .iter()
         .flat_map(|t| t.vertices.iter().flatten())
@@ -649,8 +747,6 @@ fn trace_scene(
         return Err("triangle vertices must be finite".into());
     }
 
-    unsafe { renderer.device.device_wait_idle() }
-        .map_err(|e| format!("waiting for prior ray tracing work failed: {e:?}"))?;
     for handle in [&mut renderer.tlas, &mut renderer.blas] {
         if *handle != vk::AccelerationStructureKHR::null() {
             unsafe {
@@ -857,6 +953,8 @@ fn trace_scene(
         right: [right[0], right[1], right[2], 0.0],
         up: [up[0], up[1], up[2], 0.0],
         tan_half_fov: (camera.vertical_fov_degrees.to_radians() * 0.5).tan(),
+        near_plane: camera.near_plane,
+        far_plane: camera.far_plane,
         width: renderer.width,
         height: renderer.height,
         _padding: 0,
@@ -1011,14 +1109,34 @@ fn trace_scene(
         .map_err(|e| format!("ending ray tracing command buffer failed: {e:?}"))?;
         let commands = [command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        unsafe {
+        let fence = unsafe {
             renderer
                 .device
-                .queue_submit(renderer.queue, &submits, vk::Fence::null())
+                .create_fence(&vk::FenceCreateInfo::default(), None)
         }
-        .map_err(|e| format!("submitting ray tracing work failed: {e:?}"))?;
-        unsafe { renderer.device.queue_wait_idle(renderer.queue) }
-            .map_err(|e| format!("waiting for ray tracing work failed: {e:?}"))?;
+        .map_err(|e| format!("creating ray tracing fence failed: {e:?}"))?;
+        let submit_result = queue_submit_then_wait(
+            &renderer._shared.queue_access,
+            || {
+                unsafe {
+                    renderer
+                        .device
+                        .queue_submit(renderer.queue, &submits, fence)
+                }
+                .map_err(|e| format!("submitting ray tracing work failed: {e:?}"))
+            },
+            |_| {
+                unsafe { renderer.device.wait_for_fences(&[fence], true, u64::MAX) }
+                    .map_err(|e| format!("waiting for ray tracing work failed: {e:?}"))
+            },
+        );
+        if let Err(error) = submit_result {
+            let _queue_guard = renderer._shared.lock_queue();
+            let _ = unsafe { renderer.device.device_wait_idle() };
+            unsafe { renderer.device.destroy_fence(fence, None) };
+            return Err(error);
+        }
+        unsafe { renderer.device.destroy_fence(fence, None) };
         Ok(())
     })();
     unsafe {
@@ -1059,6 +1177,20 @@ fn destroy_buffer(device: &Device, buffer: &mut Buffer) {
     *buffer = Buffer::default();
 }
 
+fn queue_submit_then_wait<T>(
+    queue_access: &Mutex<()>,
+    submit: impl FnOnce() -> Result<T, String>,
+    wait: impl FnOnce(T) -> Result<(), String>,
+) -> Result<(), String> {
+    let submission = {
+        let _queue_guard = queue_access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        submit()?
+    };
+    wait(submission)
+}
+
 fn normalize(v: [f32; 3]) -> Result<[f32; 3], String> {
     let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if !length.is_finite() || length <= f32::EPSILON {
@@ -1077,4 +1209,41 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::queue_submit_then_wait;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    #[test]
+    fn queue_submit_releases_lock_before_wait() {
+        let queue_access = Arc::new(Mutex::new(()));
+        let wait_entered = Arc::new(Barrier::new(2));
+        let release_wait = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let worker_queue = Arc::clone(&queue_access);
+            let worker_entered = Arc::clone(&wait_entered);
+            let worker_release = Arc::clone(&release_wait);
+            let worker = scope.spawn(move || {
+                queue_submit_then_wait(
+                    &worker_queue,
+                    || Ok(()),
+                    |_| {
+                        worker_entered.wait();
+                        worker_release.wait();
+                        Ok(())
+                    },
+                )
+            });
+
+            wait_entered.wait();
+            let lock_available = queue_access.try_lock().is_ok();
+            release_wait.wait();
+            worker.join().unwrap().unwrap();
+
+            assert!(lock_available, "queue lock stayed held while waiting");
+        });
+    }
 }

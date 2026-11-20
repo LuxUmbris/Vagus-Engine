@@ -1,4 +1,4 @@
-use nucleus::{ShaderDevice, validate_spirv_words};
+use nucleus::validate_spirv_words;
 
 fn minimal_vertex_spirv() -> Vec<u32> {
     vec![
@@ -46,19 +46,4 @@ fn spirv_validation_rejects_bad_headers_and_truncated_instructions() {
     let mut truncated_instruction = valid.clone();
     truncated_instruction[5] = 0x0003_0011;
     assert!(validate_spirv_words(&truncated_instruction).is_err());
-}
-
-#[test]
-fn shader_device_creates_vulkan_shader_module_when_available() {
-    let device = match ShaderDevice::new() {
-        Ok(device) => device,
-        Err(error) => {
-            eprintln!("skipping Vulkan shader-module creation: {error}");
-            return;
-        }
-    };
-    let module = device
-        .create_shader_module(&minimal_vertex_spirv())
-        .expect("create Vulkan shader module");
-    drop(module);
 }

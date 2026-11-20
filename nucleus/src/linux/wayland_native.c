@@ -22,6 +22,17 @@
 #include <xkbcommon/xkbcommon.h>
 #include "xdg-decoration-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "text-input-unstable-v3-client-protocol.h"
+
+#define VAGUS_EVENT_SCROLL_VALUE120 10
+#define VAGUS_EVENT_SCROLL_DISCRETE 11
+#define VAGUS_EVENT_KEYSYM 12
+#define VAGUS_EVENT_TEXT_COMMIT 13
+#define VAGUS_EVENT_TEXT_PREEDIT 14
+#define VAGUS_EVENT_TEXT_DELETE_SURROUNDING 15
+#define VAGUS_EVENT_TEXT_COMMIT_CHUNK 16
+#define VAGUS_PREEDIT_TEXT_CAPACITY 512
+#define VAGUS_EVENT_QUEUE_INITIAL_CAPACITY 512
 
 typedef struct
 {
@@ -34,7 +45,19 @@ typedef struct
     uint32_t pressed;
     double delta_x;
     double delta_y;
+    char text[VAGUS_PREEDIT_TEXT_CAPACITY];
+    int32_t cursor_begin;
+    int32_t cursor_end;
+    uint32_t delete_before;
+    uint32_t delete_after;
 } VagusEvent;
+
+typedef struct
+{
+    VagusEvent *items;
+    size_t count;
+    size_t capacity;
+} VagusEventQueue;
 
 typedef struct
 {
@@ -42,6 +65,8 @@ typedef struct
     struct wl_compositor *compositor;
     struct wl_surface *surface;
     struct wl_seat *seat;
+    struct zwp_text_input_manager_v3 *text_input_manager;
+    struct zwp_text_input_v3 *text_input;
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
     struct xkb_context *xkb_context;
@@ -52,18 +77,119 @@ typedef struct
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
     struct zxdg_toplevel_decoration_v1 *decoration;
-    VagusEvent events[512];
-    size_t event_count;
+    VagusEventQueue events;
+    double pending_axis_x;
+    double pending_axis_y;
+    int pending_axis_x_valid;
+    int pending_axis_y_valid;
+    int pending_axis_x_has_wheel_delta;
+    int pending_axis_y_has_wheel_delta;
+    VagusEventQueue pending_text_events;
+    int event_queue_failed;
     int configured;
     int32_t width;
     int32_t height;
     int fullscreen;
+    int text_input_active;
+    char pending_preedit[VAGUS_PREEDIT_TEXT_CAPACITY];
+    int32_t preedit_cursor_begin;
+    int32_t preedit_cursor_end;
+    int preedit_pending;
 } VagusWaylandWindow;
+
+size_t vagus_wayland_event_size(void)
+{
+    return sizeof(VagusEvent);
+}
+
+int vagus_wayland_should_emit_raw_axis_scroll(int has_wheel_delta)
+{
+    return !has_wheel_delta;
+}
+
+void vagus_wayland_filter_raw_axis_scroll(double axis_x, int axis_x_valid,
+                                          int axis_x_has_wheel_delta, double axis_y,
+                                          int axis_y_valid, int axis_y_has_wheel_delta,
+                                          double *delta_x, double *delta_y)
+{
+    *delta_x = axis_x_valid &&
+                       vagus_wayland_should_emit_raw_axis_scroll(axis_x_has_wheel_delta)
+                   ? axis_x
+                   : 0.0;
+    *delta_y = axis_y_valid &&
+                       vagus_wayland_should_emit_raw_axis_scroll(axis_y_has_wheel_delta)
+                   ? axis_y
+                   : 0.0;
+}
+
+int vagus_wayland_should_defer_axis_scroll(uint32_t pointer_version)
+{
+    return pointer_version >= 5;
+}
+
+static int queue_push(VagusEventQueue *queue, VagusEvent event)
+{
+    if (queue->count == queue->capacity)
+    {
+        size_t capacity = queue->capacity ? queue->capacity : VAGUS_EVENT_QUEUE_INITIAL_CAPACITY;
+        if (queue->capacity)
+        {
+            if (capacity > SIZE_MAX / 2)
+                return 0;
+            capacity *= 2;
+        }
+        if (capacity > SIZE_MAX / sizeof(*queue->items))
+            return 0;
+        VagusEvent *items = realloc(queue->items, capacity * sizeof(*items));
+        if (!items)
+            return 0;
+        queue->items = items;
+        queue->capacity = capacity;
+    }
+    queue->items[queue->count++] = event;
+    return 1;
+}
+
+static void free_event_queues(VagusWaylandWindow *window)
+{
+    free(window->events.items);
+    free(window->pending_text_events.items);
+    window->events = (VagusEventQueue){0};
+    window->pending_text_events = (VagusEventQueue){0};
+}
 
 static void push_event(VagusWaylandWindow *window, VagusEvent event)
 {
-    if (window->event_count < sizeof(window->events) / sizeof(window->events[0]))
-        window->events[window->event_count++] = event;
+    if (!queue_push(&window->events, event))
+        window->event_queue_failed = 1;
+}
+
+size_t vagus_wayland_test_event_queue_burst(size_t event_count)
+{
+    VagusWaylandWindow window = {0};
+    for (size_t index = 0; index < event_count; ++index)
+        push_event(&window, (VagusEvent){.kind = 1, .code = (uint32_t)index});
+    size_t queued = window.events.count;
+    for (size_t index = 0; index < queued; ++index)
+    {
+        if (window.events.items[index].code != (uint32_t)index)
+        {
+            queued = 0;
+            break;
+        }
+    }
+    free_event_queues(&window);
+    return queued;
+}
+
+static int push_pending_text_event(VagusWaylandWindow *window, VagusEvent event)
+{
+    if (!queue_push(&window->pending_text_events, event))
+    {
+        window->event_queue_failed = 1;
+        return 0;
+    }
+    return 1;
 }
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
@@ -77,8 +203,13 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     }
     else if (strcmp(interface, wl_seat_interface.name) == 0)
     {
-        uint32_t v = version < 7 ? version : 7;
+        uint32_t v = version < 8 ? version : 8;
         window->seat = wl_registry_bind(registry, name, &wl_seat_interface, v);
+    }
+    else if (strcmp(interface, zwp_text_input_manager_v3_interface.name) == 0)
+    {
+        window->text_input_manager = wl_registry_bind(
+            registry, name, &zwp_text_input_manager_v3_interface, 1);
     }
     else if (strcmp(interface, xdg_wm_base_interface.name) == 0)
     {
@@ -199,22 +330,52 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
                          uint32_t axis, wl_fixed_t value)
 {
-    (void)pointer;
+    VagusWaylandWindow *window = data;
     (void)time;
-    double delta = -wl_fixed_to_double(value);
-    VagusEvent event = {.kind = 7};
-    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
-        event.delta_x = delta;
-    else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-        event.delta_y = delta;
-    else
+    double delta = wl_fixed_to_double(value);
+    if (axis != WL_POINTER_AXIS_HORIZONTAL_SCROLL && axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
-    push_event(data, event);
+
+    if (!vagus_wayland_should_defer_axis_scroll(wl_pointer_get_version(pointer)))
+    {
+        VagusEvent event = {.kind = 7};
+        if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+            event.delta_x = delta;
+        else
+            event.delta_y = delta;
+        push_event(window, event);
+        return;
+    }
+
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    {
+        window->pending_axis_x += delta;
+        window->pending_axis_x_valid = 1;
+    }
+    else
+    {
+        window->pending_axis_y += delta;
+        window->pending_axis_y_valid = 1;
+    }
 }
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
-    (void)data;
     (void)pointer;
+    VagusWaylandWindow *window = data;
+    VagusEvent event = {.kind = 7};
+    vagus_wayland_filter_raw_axis_scroll(
+        window->pending_axis_x, window->pending_axis_x_valid,
+        window->pending_axis_x_has_wheel_delta, window->pending_axis_y,
+        window->pending_axis_y_valid, window->pending_axis_y_has_wheel_delta,
+        &event.delta_x, &event.delta_y);
+    if (event.delta_x != 0.0 || event.delta_y != 0.0)
+        push_event(window, event);
+    window->pending_axis_x = 0.0;
+    window->pending_axis_y = 0.0;
+    window->pending_axis_x_valid = 0;
+    window->pending_axis_y_valid = 0;
+    window->pending_axis_x_has_wheel_delta = 0;
+    window->pending_axis_y_has_wheel_delta = 0;
 }
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source)
 {
@@ -231,17 +392,41 @@ static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t t
 }
 static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
 {
-    (void)data;
-    (void)pointer;
-    (void)axis;
-    (void)discrete;
+    if (wl_pointer_get_version(pointer) >= 8)
+        return;
+    VagusEvent event = {.kind = VAGUS_EVENT_SCROLL_DISCRETE};
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    {
+        ((VagusWaylandWindow *)data)->pending_axis_x_has_wheel_delta = 1;
+        event.delta_x = discrete;
+    }
+    else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    {
+        ((VagusWaylandWindow *)data)->pending_axis_y_has_wheel_delta = 1;
+        event.delta_y = discrete;
+    }
+    else
+        return;
+    push_event(data, event);
 }
 static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120)
 {
-    (void)data;
-    (void)pointer;
-    (void)axis;
-    (void)value120;
+    if (wl_pointer_get_version(pointer) < 8)
+        return;
+    VagusEvent event = {.kind = VAGUS_EVENT_SCROLL_VALUE120};
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    {
+        ((VagusWaylandWindow *)data)->pending_axis_x_has_wheel_delta = 1;
+        event.delta_x = value120;
+    }
+    else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    {
+        ((VagusWaylandWindow *)data)->pending_axis_y_has_wheel_delta = 1;
+        event.delta_y = value120;
+    }
+    else
+        return;
+    push_event(data, event);
 }
 static const struct wl_pointer_listener pointer_listener = {
     pointer_enter, pointer_leave, pointer_motion, pointer_button, pointer_axis,
@@ -291,6 +476,338 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
     window->xkb_keymap = keymap;
     window->xkb_state = state;
 }
+static void text_input_enter(void *data, struct zwp_text_input_v3 *text_input,
+                             struct wl_surface *surface)
+{
+    (void)data;
+    (void)text_input;
+    (void)surface;
+}
+
+static void text_input_leave(void *data, struct zwp_text_input_v3 *text_input,
+                             struct wl_surface *surface)
+{
+    (void)text_input;
+    (void)surface;
+    ((VagusWaylandWindow *)data)->text_input_active = 0;
+}
+
+static void text_input_preedit(void *data, struct zwp_text_input_v3 *text_input,
+                               const char *text, int32_t cursor_begin, int32_t cursor_end)
+{
+    VagusWaylandWindow *window = data;
+    (void)text_input;
+    size_t length = text ? strlen(text) : 0;
+    size_t copied = length < sizeof(window->pending_preedit)
+                        ? length
+                        : sizeof(window->pending_preedit) - 1;
+    if (copied < length)
+    {
+        while (copied > 0 && (((unsigned char)text[copied] & 0xc0) == 0x80))
+            --copied;
+    }
+    if (copied)
+        memcpy(window->pending_preedit, text, copied);
+    window->pending_preedit[copied] = '\0';
+    window->preedit_cursor_begin = copied < length ? -1 : cursor_begin;
+    window->preedit_cursor_end = copied < length ? -1 : cursor_end;
+    if (!text)
+    {
+        window->preedit_cursor_begin = -1;
+        window->preedit_cursor_end = -1;
+    }
+    window->preedit_pending = 1;
+}
+
+int vagus_wayland_decode_utf8_scalar(const unsigned char *bytes, size_t available,
+                                     uint32_t *codepoint_out, size_t *consumed_out)
+{
+    if (consumed_out)
+        *consumed_out = 0;
+    if (!bytes || !codepoint_out || !consumed_out || available == 0)
+        return 0;
+
+    *consumed_out = 1;
+    uint32_t codepoint;
+    size_t length;
+    if (bytes[0] < 0x80)
+    {
+        codepoint = bytes[0];
+        length = 1;
+    }
+    else if (bytes[0] >= 0xc2 && bytes[0] <= 0xdf)
+    {
+        codepoint = bytes[0] & 0x1f;
+        length = 2;
+    }
+    else if (bytes[0] >= 0xe0 && bytes[0] <= 0xef)
+    {
+        codepoint = bytes[0] & 0x0f;
+        length = 3;
+    }
+    else if (bytes[0] >= 0xf0 && bytes[0] <= 0xf4)
+    {
+        codepoint = bytes[0] & 0x07;
+        length = 4;
+    }
+    else
+    {
+        return 0;
+    }
+
+    if (length > available)
+        return 0;
+    for (size_t index = 1; index < length; ++index)
+    {
+        if ((bytes[index] & 0xc0) != 0x80)
+            return 0;
+        codepoint = (codepoint << 6) | (bytes[index] & 0x3f);
+    }
+    if ((length == 2 && codepoint < 0x80) ||
+        (length == 3 && codepoint < 0x800) ||
+        (length == 4 && codepoint < 0x10000) ||
+        codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff))
+        return 0;
+
+    *codepoint_out = codepoint;
+    *consumed_out = length;
+    return 1;
+}
+
+size_t vagus_wayland_encode_committed_utf8(const char *text, VagusEvent *output,
+                                           size_t capacity)
+{
+    if (text == NULL || (output == NULL && capacity != 0))
+        return (size_t)-1;
+
+    const unsigned char *cursor = (const unsigned char *)text;
+    size_t remaining = strlen(text);
+    size_t event_count = 0;
+    size_t chunk_length = 0;
+    VagusEvent event = {.kind = VAGUS_EVENT_TEXT_COMMIT_CHUNK};
+    while (remaining > 0)
+    {
+        uint32_t codepoint;
+        size_t consumed;
+        int valid = vagus_wayland_decode_utf8_scalar(cursor, remaining, &codepoint, &consumed);
+        if (valid)
+        {
+            if (chunk_length + consumed >= sizeof(event.text))
+            {
+                if (event_count == capacity)
+                    return (size_t)-1;
+                event.text[chunk_length] = '\0';
+                output[event_count++] = event;
+                event = (VagusEvent){.kind = VAGUS_EVENT_TEXT_COMMIT_CHUNK};
+                chunk_length = 0;
+            }
+            memcpy(event.text + chunk_length, cursor, consumed);
+            chunk_length += consumed;
+        }
+        cursor += consumed;
+        remaining -= consumed;
+    }
+
+    if (chunk_length > 0)
+    {
+        if (event_count == capacity)
+            return (size_t)-1;
+        event.text[chunk_length] = '\0';
+        output[event_count++] = event;
+    }
+    return event_count;
+}
+
+static void push_committed_utf8(VagusWaylandWindow *window, const char *text)
+{
+    if (!text)
+        return;
+
+    const unsigned char *cursor = (const unsigned char *)text;
+    size_t remaining = strlen(text);
+    size_t chunk_length = 0;
+    VagusEvent event = {.kind = VAGUS_EVENT_TEXT_COMMIT_CHUNK};
+    while (remaining > 0)
+    {
+        uint32_t codepoint;
+        size_t consumed;
+        int valid = vagus_wayland_decode_utf8_scalar(cursor, remaining, &codepoint, &consumed);
+        if (valid)
+        {
+            if (chunk_length + consumed >= sizeof(event.text))
+            {
+                event.text[chunk_length] = '\0';
+                if (!push_pending_text_event(window, event))
+                    return;
+                event = (VagusEvent){.kind = VAGUS_EVENT_TEXT_COMMIT_CHUNK};
+                chunk_length = 0;
+            }
+            memcpy(event.text + chunk_length, cursor, consumed);
+            chunk_length += consumed;
+        }
+        cursor += consumed;
+        remaining -= consumed;
+    }
+
+    if (chunk_length > 0)
+    {
+        event.text[chunk_length] = '\0';
+        push_pending_text_event(window, event);
+    }
+}
+
+size_t vagus_wayland_test_committed_text_burst(size_t expected_chunks)
+{
+    const size_t chunk_capacity = sizeof(((VagusEvent *)0)->text) - 1;
+    const size_t bytes_per_chunk = chunk_capacity - (chunk_capacity % 2);
+    if (expected_chunks > (SIZE_MAX - 1) / bytes_per_chunk)
+        return 0;
+    size_t text_length = expected_chunks * bytes_per_chunk;
+    char *text = malloc(text_length + 1);
+    if (!text)
+        return 0;
+    for (size_t index = 0; index < text_length; index += 2)
+    {
+        text[index] = (char)0xc3;
+        text[index + 1] = (char)0xa9;
+    }
+    text[text_length] = '\0';
+
+    VagusWaylandWindow window = {0};
+    push_committed_utf8(&window, text);
+    int valid = !window.event_queue_failed &&
+                window.pending_text_events.count == expected_chunks;
+    size_t recovered_length = 0;
+    for (size_t index = 0; valid && index < window.pending_text_events.count; ++index)
+    {
+        VagusEvent *event = &window.pending_text_events.items[index];
+        if (event->kind != VAGUS_EVENT_TEXT_COMMIT_CHUNK)
+        {
+            valid = 0;
+            break;
+        }
+        size_t chunk_length = 0;
+        while (chunk_length < sizeof(event->text) && event->text[chunk_length] != '\0')
+            ++chunk_length;
+        if (chunk_length == sizeof(event->text) || chunk_length % 2 != 0)
+            valid = 0;
+        for (size_t offset = 0; valid && offset < chunk_length; offset += 2)
+        {
+            if ((unsigned char)event->text[offset] != 0xc3 ||
+                (unsigned char)event->text[offset + 1] != 0xa9)
+                valid = 0;
+        }
+        recovered_length += chunk_length;
+    }
+    valid = valid && recovered_length == text_length;
+    size_t result = valid ? window.pending_text_events.count : 0;
+    free(text);
+    free_event_queues(&window);
+    return result;
+}
+
+static void text_input_commit_string(void *data, struct zwp_text_input_v3 *text_input,
+                                     const char *text)
+{
+    (void)text_input;
+    if (text)
+        push_committed_utf8(data, text);
+}
+
+static void text_input_delete_surrounding(void *data, struct zwp_text_input_v3 *text_input,
+                                          uint32_t before_length, uint32_t after_length)
+{
+    (void)text_input;
+    VagusWaylandWindow *window = data;
+    push_pending_text_event(window, (VagusEvent){
+        .kind = VAGUS_EVENT_TEXT_DELETE_SURROUNDING,
+        .delete_before = before_length,
+        .delete_after = after_length,
+    });
+}
+
+static void text_input_done(void *data, struct zwp_text_input_v3 *text_input, uint32_t serial)
+{
+    VagusWaylandWindow *window = data;
+    (void)text_input;
+    (void)serial;
+    push_event(window, (VagusEvent){
+        .kind = VAGUS_EVENT_TEXT_PREEDIT,
+        .cursor_begin = -1,
+        .cursor_end = -1,
+    });
+    for (size_t index = 0; index < window->pending_text_events.count; ++index)
+    {
+        if (window->pending_text_events.items[index].kind == VAGUS_EVENT_TEXT_DELETE_SURROUNDING)
+            push_event(window, window->pending_text_events.items[index]);
+    }
+    for (size_t index = 0; index < window->pending_text_events.count; ++index)
+    {
+        if (window->pending_text_events.items[index].kind == VAGUS_EVENT_TEXT_COMMIT ||
+            window->pending_text_events.items[index].kind == VAGUS_EVENT_TEXT_COMMIT_CHUNK)
+            push_event(window, window->pending_text_events.items[index]);
+    }
+    window->pending_text_events.count = 0;
+    VagusEvent event = {.kind = VAGUS_EVENT_TEXT_PREEDIT};
+    if (window->preedit_pending)
+    {
+        event.cursor_begin = window->preedit_cursor_begin;
+        event.cursor_end = window->preedit_cursor_end;
+        memcpy(event.text, window->pending_preedit, sizeof(event.text));
+    }
+    if (window->preedit_pending)
+        push_event(window, event);
+    window->preedit_pending = 0;
+}
+
+int vagus_wayland_test_preedit_truncates_on_utf8_boundary(void)
+{
+    char text[VAGUS_PREEDIT_TEXT_CAPACITY + 3] = {0};
+    size_t prefix_length = VAGUS_PREEDIT_TEXT_CAPACITY - 2;
+    memset(text, 'a', prefix_length);
+    text[prefix_length] = (char)0xf0;
+    text[prefix_length + 1] = (char)0x9f;
+    text[prefix_length + 2] = (char)0x99;
+    text[prefix_length + 3] = (char)0x82;
+    text[prefix_length + 4] = '\0';
+
+    VagusWaylandWindow window = {0};
+    text_input_preedit(&window, NULL, text, (int32_t)prefix_length,
+                       (int32_t)(prefix_length + 4));
+    text_input_done(&window, NULL, 0);
+
+    int valid = !window.event_queue_failed && window.events.count == 2;
+    if (valid)
+    {
+        VagusEvent *preedit = &window.events.items[1];
+        valid = preedit->kind == VAGUS_EVENT_TEXT_PREEDIT &&
+                strlen(preedit->text) == prefix_length &&
+                preedit->cursor_begin == -1 && preedit->cursor_end == -1 &&
+                memcmp(preedit->text, text, prefix_length) == 0;
+    }
+    free_event_queues(&window);
+    return valid;
+}
+
+static void text_input_action(void *data, struct zwp_text_input_v3 *text_input,
+                              uint32_t action, uint32_t serial)
+{
+    (void)data;
+    (void)text_input;
+    (void)action;
+    (void)serial;
+}
+
+static const struct zwp_text_input_v3_listener text_input_listener = {
+    .enter = text_input_enter,
+    .leave = text_input_leave,
+    .preedit_string = text_input_preedit,
+    .commit_string = text_input_commit_string,
+    .delete_surrounding_text = text_input_delete_surrounding,
+    .done = text_input_done,
+    .action = text_input_action,
+};
+
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface, struct wl_array *keys)
 {
@@ -298,15 +815,30 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     (void)serial;
     (void)surface;
     (void)keys;
-    push_event(data, (VagusEvent){.kind = 8, .pressed = 1});
+    VagusWaylandWindow *window = data;
+    push_event(window, (VagusEvent){.kind = 8, .pressed = 1});
+    if (window->text_input)
+    {
+        zwp_text_input_v3_enable(window->text_input);
+        zwp_text_input_v3_commit(window->text_input);
+        window->text_input_active = 1;
+    }
 }
+
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface)
 {
     (void)keyboard;
     (void)serial;
     (void)surface;
-    push_event(data, (VagusEvent){.kind = 8, .pressed = 0});
+    VagusWaylandWindow *window = data;
+    push_event(window, (VagusEvent){.kind = 8, .pressed = 0});
+    window->text_input_active = 0;
+    if (window->text_input)
+    {
+        zwp_text_input_v3_disable(window->text_input);
+        zwp_text_input_v3_commit(window->text_input);
+    }
 }
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                          uint32_t time, uint32_t key, uint32_t state)
@@ -322,11 +854,11 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
         xkb_keycode_t keycode = key + 8;
         xkb_state_update_key(window->xkb_state, keycode,
                              state == WL_KEYBOARD_KEY_STATE_PRESSED ? XKB_KEY_DOWN : XKB_KEY_UP);
-        if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        if (state == WL_KEYBOARD_KEY_STATE_PRESSED && !window->text_input_active)
         {
-            uint32_t codepoint = xkb_state_key_get_utf32(window->xkb_state, keycode);
-            if (codepoint)
-                push_event(window, (VagusEvent){.kind = 9, .code = codepoint});
+            xkb_keysym_t keysym = xkb_state_key_get_one_sym(window->xkb_state, keycode);
+            if (keysym != XKB_KEY_NoSymbol)
+                push_event(window, (VagusEvent){.kind = VAGUS_EVENT_KEYSYM, .code = keysym});
         }
     }
 }
@@ -396,6 +928,14 @@ void *vagus_wayland_create(const char *title, int32_t width, int32_t height)
     window->surface = wl_compositor_create_surface(window->compositor);
     if (!window->surface)
         goto fail;
+    if (window->text_input_manager && window->seat)
+    {
+        window->text_input = zwp_text_input_manager_v3_get_text_input(
+            window->text_input_manager, window->seat);
+        if (!window->text_input ||
+            zwp_text_input_v3_add_listener(window->text_input, &text_input_listener, window) < 0)
+            goto fail;
+    }
     window->xdg_surface = xdg_wm_base_get_xdg_surface(window->wm_base, window->surface);
     if (!window->xdg_surface)
         goto fail;
@@ -427,6 +967,10 @@ void *vagus_wayland_create(const char *title, int32_t width, int32_t height)
     wl_registry_destroy(registry);
     return window;
 fail:
+    if (window->text_input)
+        zwp_text_input_v3_destroy(window->text_input);
+    if (window->text_input_manager)
+        zwp_text_input_manager_v3_destroy(window->text_input_manager);
     if (window->xkb_state)
         xkb_state_unref(window->xkb_state);
     if (window->xkb_keymap)
@@ -435,6 +979,7 @@ fail:
         xkb_context_unref(window->xkb_context);
     if (window->display)
         wl_display_disconnect(window->display);
+    free_event_queues(window);
     free(window);
     return NULL;
 }
@@ -454,11 +999,24 @@ int32_t vagus_wayland_poll(void *opaque, VagusEvent *output, int32_t capacity)
     } while (ready < 0 && errno == EINTR);
     if (ready > 0)
         wl_display_dispatch(window->display);
-    int32_t count = window->event_count < (size_t)capacity ? (int32_t)window->event_count : capacity;
-    memcpy(output, window->events, (size_t)count * sizeof(*output));
-    memmove(window->events, window->events + count,
-            (window->event_count - (size_t)count) * sizeof(*output));
-    window->event_count -= (size_t)count;
+    if (window->event_queue_failed)
+    {
+        window->event_queue_failed = 0;
+        errno = ENOMEM;
+        return -1;
+    }
+    int32_t count = window->events.count < (size_t)capacity
+                        ? (int32_t)window->events.count
+                        : capacity;
+    if (count > 0)
+    {
+        memcpy(output, window->events.items, (size_t)count * sizeof(*output));
+        size_t remaining = window->events.count - (size_t)count;
+        if (remaining > 0)
+            memmove(window->events.items, window->events.items + count,
+                    remaining * sizeof(*output));
+        window->events.count = remaining;
+    }
     return count;
 }
 
@@ -478,6 +1036,23 @@ int32_t vagus_wayland_set_title(void *opaque, const char *title)
     if (!window || !title)
         return -1;
     xdg_toplevel_set_title(window->toplevel, title);
+    if (wl_display_flush(window->display) < 0 && errno != EAGAIN)
+        return -2;
+    return 0;
+}
+int32_t vagus_wayland_set_surrounding_text(void *opaque, const char *text,
+                                           int32_t cursor, int32_t anchor)
+{
+    VagusWaylandWindow *window = opaque;
+    if (!window || !text || !window->text_input || cursor < 0 || anchor < 0)
+        return -1;
+    size_t length = strlen(text);
+    if (length > 4000 || (size_t)cursor > length || (size_t)anchor > length)
+        return -1;
+
+    zwp_text_input_v3_set_surrounding_text(window->text_input, text, cursor, anchor);
+    if (window->text_input_active)
+        zwp_text_input_v3_commit(window->text_input);
     if (wl_display_flush(window->display) < 0 && errno != EAGAIN)
         return -2;
     return 0;
@@ -548,6 +1123,10 @@ void vagus_wayland_destroy(void *opaque)
         wl_pointer_destroy(window->pointer);
     if (window->keyboard)
         wl_keyboard_destroy(window->keyboard);
+    if (window->text_input)
+        zwp_text_input_v3_destroy(window->text_input);
+    if (window->text_input_manager)
+        zwp_text_input_manager_v3_destroy(window->text_input_manager);
     if (window->xkb_state)
         xkb_state_unref(window->xkb_state);
     if (window->xkb_keymap)
@@ -572,5 +1151,6 @@ void vagus_wayland_destroy(void *opaque)
         wl_compositor_destroy(window->compositor);
     wl_display_flush(window->display);
     wl_display_disconnect(window->display);
+    free_event_queues(window);
     free(window);
 }

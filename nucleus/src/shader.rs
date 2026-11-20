@@ -11,8 +11,9 @@
 //!
 //! Authors: Vincent Noll
 
-use ash::{Device, Entry, Instance, vk};
-use std::{ffi::CString, sync::Arc};
+use crate::vulkan::SharedDevice;
+use ash::vk;
+use std::sync::Arc;
 
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const SPIRV_MAX_MINOR: u32 = 6;
@@ -58,83 +59,19 @@ pub fn validate_spirv_words(words: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
-struct DeviceInner {
-    _entry: Entry,
-    instance: Instance,
-    device: Device,
-}
-
-impl Drop for DeviceInner {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct ShaderDevice {
-    inner: Arc<DeviceInner>,
+    inner: Arc<SharedDevice>,
 }
 
 pub struct ShaderModule {
-    inner: Arc<DeviceInner>,
+    inner: Arc<SharedDevice>,
     handle: vk::ShaderModule,
 }
 
 impl ShaderDevice {
-    pub fn new() -> Result<Self, String> {
-        let entry =
-            unsafe { Entry::load() }.map_err(|error| format!("failed to load Vulkan: {error}"))?;
-        let app_name = CString::new("Vagus shader device").expect("static string has no NUL");
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .engine_name(&app_name)
-            .api_version(vk::API_VERSION_1_0);
-        let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
-        let instance = unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|error| format!("failed to create Vulkan instance: {error}"))?;
-
-        let physical_devices = match unsafe { instance.enumerate_physical_devices() } {
-            Ok(devices) => devices,
-            Err(error) => {
-                unsafe { instance.destroy_instance(None) };
-                return Err(format!("failed to enumerate Vulkan devices: {error}"));
-            }
-        };
-        let selection = physical_devices.into_iter().find_map(|physical| {
-            unsafe { instance.get_physical_device_queue_family_properties(physical) }
-                .iter()
-                .position(|family| family.queue_count > 0)
-                .map(|index| (physical, index as u32))
-        });
-        let Some((physical, queue_family)) = selection else {
-            unsafe { instance.destroy_instance(None) };
-            return Err("no Vulkan device with a usable queue family was found".into());
-        };
-
-        let priorities = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&priorities)];
-        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
-        let device = match unsafe { instance.create_device(physical, &device_info, None) } {
-            Ok(device) => device,
-            Err(error) => {
-                unsafe { instance.destroy_instance(None) };
-                return Err(format!("failed to create Vulkan shader device: {error}"));
-            }
-        };
-
-        Ok(Self {
-            inner: Arc::new(DeviceInner {
-                _entry: entry,
-                instance,
-                device,
-            }),
-        })
+    pub(crate) fn from_shared(inner: Arc<SharedDevice>) -> Self {
+        Self { inner }
     }
 
     pub fn create_shader_module(&self, words: &[u32]) -> Result<ShaderModule, String> {
@@ -146,6 +83,12 @@ impl ShaderDevice {
             inner: Arc::clone(&self.inner),
             handle,
         })
+    }
+}
+
+impl ShaderModule {
+    pub fn belongs_to_device(&self, device: &ShaderDevice) -> bool {
+        Arc::ptr_eq(&self.inner, &device.inner)
     }
 }
 

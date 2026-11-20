@@ -15,6 +15,7 @@ use super::heightmap;
 use super::texture;
 
 /// A CPU-side terrain material pairing an image texture with elevation data.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     texture: texture::Texture,
     heightmap: heightmap::HeightMap,

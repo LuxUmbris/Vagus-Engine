@@ -19,7 +19,10 @@ use std::ffi::{OsStr, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
-use crate::Event;
+use crate::input_text::{
+    decode_utf16_preedit, decode_utf16_text, emit_ime_composition_events, Utf16InputState,
+};
+use crate::{windows_scroll_event, Event};
 
 type Handle = *mut c_void;
 type HInstance = Handle;
@@ -138,6 +141,18 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[link(name = "imm32")]
+unsafe extern "system" {
+    fn ImmGetContext(hwnd: Handle) -> Handle;
+    fn ImmReleaseContext(hwnd: Handle, context: Handle) -> i32;
+    fn ImmGetCompositionStringW(
+        context: Handle,
+        index: u32,
+        buffer: *mut c_void,
+        length: u32,
+    ) -> i32;
+}
+
 const CLASS_NAME: &[u16] = &[86, 97, 103, 117, 115, 87, 105, 110, 100, 111, 119, 0];
 const CS_HREDRAW: u32 = 0x0002;
 const CS_VREDRAW: u32 = 0x0001;
@@ -182,14 +197,21 @@ const WM_CHAR: u32 = 0x0102;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
 const WM_SYSCHAR: u32 = 0x0106;
+const WM_UNICHAR: u32 = 0x0109;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010e;
+const WM_IME_COMPOSITION: u32 = 0x010f;
+const GCS_COMPSTR: u32 = 0x0008;
+const GCS_CURSORPOS: u32 = 0x0080;
+const GCS_RESULTSTR: u32 = 0x0800;
+const UNICODE_NOCHAR: WParam = 0xffff;
 const TME_LEAVE: u32 = 0x00000002;
-const WHEEL_DELTA: f64 = 120.0;
 const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 
 thread_local! {
     static EVENTS: RefCell<HashMap<isize, VecDeque<Event>>> = RefCell::new(HashMap::new());
     static POINTER_INSIDE: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
-    static PENDING_HIGH_SURROGATE: RefCell<HashMap<isize, u16>> = RefCell::new(HashMap::new());
+    static PENDING_HIGH_SURROGATE: RefCell<HashMap<isize, Utf16InputState>> =
+        RefCell::new(HashMap::new());
 }
 
 pub struct Window {
@@ -472,6 +494,66 @@ fn last_error(operation: &str) -> String {
     format!("{operation} failed: {}", unsafe { GetLastError() })
 }
 
+fn read_ime_text(context: Handle, index: u32) -> Option<Vec<u16>> {
+    let byte_count = unsafe { ImmGetCompositionStringW(context, index, ptr::null_mut(), 0) };
+    if byte_count < 0 || byte_count % 2 != 0 {
+        return None;
+    }
+
+    let unit_count = usize::try_from(byte_count).ok()? / std::mem::size_of::<u16>();
+    let mut units = Vec::new();
+    units.try_reserve_exact(unit_count).ok()?;
+    units.resize(unit_count, 0);
+    if byte_count == 0 {
+        return Some(units);
+    }
+
+    let written = unsafe {
+        ImmGetCompositionStringW(context, index, units.as_mut_ptr().cast(), byte_count as u32)
+    };
+    (written == byte_count).then_some(units)
+}
+
+fn handle_ime_composition(handle: Handle, lparam: LParam) -> bool {
+    let flags = lparam as u32;
+    let has_preedit = flags & GCS_COMPSTR != 0;
+    let has_result = flags & GCS_RESULTSTR != 0;
+    if !has_preedit && !has_result {
+        return false;
+    }
+
+    let context = unsafe { ImmGetContext(handle) };
+    if context.is_null() {
+        return false;
+    }
+
+    let mut preedit = None;
+    if has_preedit {
+        if let Some(units) = read_ime_text(context, GCS_COMPSTR) {
+            let cursor_offset =
+                unsafe { ImmGetCompositionStringW(context, GCS_CURSORPOS, ptr::null_mut(), 0) };
+            preedit = Some(decode_utf16_preedit(&units, cursor_offset));
+        }
+    }
+
+    let result = has_result
+        .then(|| read_ime_text(context, GCS_RESULTSTR))
+        .flatten()
+        .map(|units| decode_utf16_text(&units));
+    let preedit_handled = preedit.is_some();
+    let result_handled = result.is_some();
+    emit_ime_composition_events(preedit, result.as_deref(), |event| {
+        queue_event(handle, event);
+    });
+
+    unsafe { ImmReleaseContext(handle, context) };
+    if has_result {
+        result_handled
+    } else {
+        preedit_handled
+    }
+}
+
 impl Drop for Window {
     fn drop(&mut self) {
         unsafe { DestroyWindow(self.handle) };
@@ -493,6 +575,20 @@ unsafe extern "system" fn window_proc(
     wparam: WParam,
     lparam: LParam,
 ) -> LResult {
+    if message == WM_IME_COMPOSITION && handle_ime_composition(handle, lparam) {
+        return 0;
+    }
+    if message == WM_IME_ENDCOMPOSITION || message == WM_KILLFOCUS {
+        queue_event(
+            handle,
+            Event::TextPreedit {
+                text: String::new(),
+                cursor_begin: -1,
+                cursor_end: -1,
+            },
+        );
+    }
+
     let event = match message {
         WM_CLOSE => Some(Event::CloseRequested),
         WM_SIZE => Some(Event::Resized {
@@ -545,18 +641,19 @@ unsafe extern "system" fn window_proc(
             button: ((wparam >> 16) as u16 as u32) + 3,
             pressed: message == WM_XBUTTONDOWN,
         }),
-        WM_MOUSEWHEEL => Some(Event::Scroll {
-            delta_x: 0.0,
-            delta_y: ((wparam >> 16) as u16 as i16) as f64 / WHEEL_DELTA,
-        }),
-        WM_MOUSEHWHEEL => Some(Event::Scroll {
-            delta_x: ((wparam >> 16) as u16 as i16) as f64 / WHEEL_DELTA,
-            delta_y: 0.0,
-        }),
+        WM_MOUSEWHEEL => Some(windows_scroll_event(wparam, false)),
+        WM_MOUSEHWHEEL => Some(windows_scroll_event(wparam, true)),
         _ => None,
     };
     if let Some(event) = event {
         queue_event(handle, event);
+    }
+    if message == WM_KILLFOCUS {
+        PENDING_HIGH_SURROGATE.with(|pending| {
+            if let Some(input) = pending.borrow_mut().get_mut(&(handle as isize)) {
+                input.reset();
+            }
+        });
     }
     if message == WM_MOUSEMOVE {
         let first_move =
@@ -581,17 +678,34 @@ unsafe extern "system" fn window_proc(
     if message == WM_CHAR || message == WM_SYSCHAR {
         let unit = wparam as u16;
         let decoded = PENDING_HIGH_SURROGATE.with(|pending| {
+            pending
+                .borrow_mut()
+                .entry(handle as isize)
+                .or_default()
+                .push(unit)
+        });
+        if let Some(character) = decoded {
+            queue_event(
+                handle,
+                Event::TextInput {
+                    codepoint: character as u32,
+                },
+            );
+        }
+    }
+    if message == WM_UNICHAR {
+        if wparam == UNICODE_NOCHAR {
+            return 1;
+        }
+        let decoded = PENDING_HIGH_SURROGATE.with(|pending| {
             let mut pending = pending.borrow_mut();
-            if (0xd800..=0xdbff).contains(&unit) {
-                pending.insert(handle as isize, unit);
-                None
-            } else if (0xdc00..=0xdfff).contains(&unit) {
-                pending
-                    .remove(&(handle as isize))
-                    .and_then(|high| char::decode_utf16([high, unit]).next().and_then(Result::ok))
-            } else {
-                pending.remove(&(handle as isize));
-                char::from_u32(unit as u32)
+            let input = pending.entry(handle as isize).or_default();
+            match u32::try_from(wparam) {
+                Ok(codepoint) => input.push_codepoint(codepoint),
+                Err(_) => {
+                    input.reset();
+                    None
+                }
             }
         });
         if let Some(character) = decoded {
@@ -602,6 +716,7 @@ unsafe extern "system" fn window_proc(
                 },
             );
         }
+        return 0;
     }
     let result = unsafe { DefWindowProcW(handle, message, wparam, lparam) };
     if message == WM_XBUTTONDOWN || message == WM_XBUTTONUP {

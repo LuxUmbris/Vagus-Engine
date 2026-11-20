@@ -25,6 +25,17 @@ struct Pair(i32, u8);
 #[derive(Soa)]
 struct Empty;
 
+#[repr(align(4096))]
+#[derive(Soa)]
+struct PaddedValue {
+    value: u8,
+}
+
+#[derive(Soa)]
+struct ZeroSizedColumn {
+    marker: std::marker::PhantomData<()>,
+}
+
 #[derive(Soa)]
 struct Generic<T> {
     value: T,
@@ -41,6 +52,199 @@ fn ecs_pushes_struct_fields_into_columns() {
     let columns = entities.storage();
     assert_eq!(columns.x.get(0), Some(&3));
     assert_eq!(columns.y.get(1), Some(&11));
+}
+
+#[test]
+fn ecs_try_replace_updates_all_columns_and_returns_rejected_input() {
+    let mut entities = ECS::<Position>::with_capacity(2).unwrap();
+    entities.push(Position { x: 3, y: 8 }).unwrap();
+    entities.push(Position { x: -4, y: 11 }).unwrap();
+
+    let replaced = match entities.try_replace(1, Position { x: 7, y: -9 }) {
+        Ok(row) => row,
+        Err(_) => panic!("valid row replacement was rejected"),
+    };
+    assert_eq!((replaced.x, replaced.y), (-4, 11));
+    assert_eq!(
+        entities.get_cloned(1).map(|row| (row.x, row.y)),
+        Some((7, -9))
+    );
+
+    let rejected = match entities.try_replace(2, Position { x: 12, y: 13 }) {
+        Err(row) => row,
+        Ok(_) => panic!("out-of-bounds row replacement succeeded"),
+    };
+    assert_eq!((rejected.x, rejected.y), (12, 13));
+    assert_eq!(entities.len(), 2);
+    assert_eq!(
+        entities.get_cloned(1).map(|row| (row.x, row.y)),
+        Some((7, -9))
+    );
+    assert_eq!(entities.storage().x.len(), 2);
+    assert_eq!(entities.storage().y.len(), 2);
+
+    let mut empty = ECS::<Empty>::with_capacity(1).unwrap();
+    empty.push(Empty).unwrap();
+    assert!(empty.try_replace(0, Empty).is_ok());
+    assert!(empty.try_replace(1, Empty).is_err());
+    assert_eq!(empty.len(), 1);
+}
+
+#[test]
+fn default_ecs_reserves_approximately_32_gib_for_rows() {
+    let mut entities = ECS::<Position>::new();
+    let target_bytes = if cfg!(all(target_pointer_width = "64", any(unix, windows))) {
+        32_u64 * 1024 * 1024 * 1024
+    } else {
+        1024_u64 * 1024 * 1024
+    };
+    let reserved_row_bytes = (entities.capacity() as u64)
+        .checked_mul(std::mem::size_of::<Position>() as u64)
+        .unwrap();
+
+    assert!(reserved_row_bytes > 0);
+    assert!(reserved_row_bytes <= target_bytes);
+
+    entities.push(Position { x: 7, y: -7 }).unwrap();
+    assert_eq!(
+        entities.get_cloned(0).map(|row| (row.x, row.y)),
+        Some((7, -7))
+    );
+}
+
+#[test]
+fn default_ecs_capacity_accounts_for_soa_column_bytes_not_row_padding() {
+    let mut entities = ECS::<PaddedValue>::new();
+    let target_bytes = if cfg!(all(target_pointer_width = "64", any(unix, windows))) {
+        32_u64 * 1024 * 1024 * 1024
+    } else {
+        1024_u64 * 1024 * 1024
+    };
+
+    let reserved_column_bytes = (entities.capacity() as u64)
+        .checked_mul(std::mem::size_of::<u8>() as u64)
+        .unwrap();
+    assert_eq!(
+        PaddedValue::STORAGE_ROW_BYTES,
+        Some(std::mem::size_of::<u8>())
+    );
+    assert!(reserved_column_bytes > 0);
+    assert!(reserved_column_bytes <= target_bytes);
+    entities.push(PaddedValue { value: 7 }).unwrap();
+    assert_eq!(entities.storage().value.get(0), Some(&7));
+}
+
+#[test]
+fn growable_ecs_accepts_a_caller_selected_initial_capacity() {
+    let mut entities = ECS::<Position>::with_growable_capacity(4).unwrap();
+    assert_eq!(entities.capacity(), 4);
+
+    entities
+        .try_extend((0..4).map(|x| Position { x, y: -x }))
+        .unwrap();
+    entities.push(Position { x: 4, y: -4 }).unwrap();
+
+    assert_eq!(entities.len(), 5);
+    assert!(entities.capacity() > 4);
+    assert_eq!(entities.get_cloned(4).map(|row| row.x), Some(4));
+}
+
+#[test]
+fn default_ecs_growth_preserves_insert_and_append_rows() {
+    let mut inserted = ECS::<Position>::with_growable_capacity(2).unwrap();
+    let initial_capacity = inserted.capacity();
+    inserted
+        .try_extend([Position { x: 0, y: 0 }, Position { x: 1, y: -1 }])
+        .unwrap();
+    inserted.insert(0, Position { x: -1, y: 1 }).unwrap();
+    assert_eq!(inserted.get_cloned(0).map(|row| row.x), Some(-1));
+    assert_eq!(inserted.get_cloned(1).map(|row| row.x), Some(0));
+    assert!(inserted.capacity() > initial_capacity);
+
+    let mut appended = ECS::<Position>::with_growable_capacity(2).unwrap();
+    let initial_capacity = appended.capacity();
+    appended
+        .try_extend([Position { x: 0, y: 0 }, Position { x: 1, y: -1 }])
+        .unwrap();
+    let mut tail = ECS::<Position>::with_capacity(2).unwrap();
+    tail.extend([Position { x: -2, y: 2 }, Position { x: -3, y: 3 }]);
+    let tail_address = tail.storage().x.get(0).unwrap() as *const i32;
+    appended.append(&mut tail).unwrap();
+    assert_eq!(
+        appended.get_cloned(initial_capacity).map(|row| row.x),
+        Some(-2)
+    );
+    assert_eq!(
+        appended.get_cloned(initial_capacity + 1).map(|row| row.x),
+        Some(-3)
+    );
+    assert_eq!(
+        appended.storage().x.get(initial_capacity).unwrap() as *const i32,
+        tail_address
+    );
+    assert!(tail.is_empty());
+    assert_eq!(tail.capacity(), 2);
+    tail.push(Position { x: -4, y: 4 }).unwrap();
+    assert_eq!(tail.get_cloned(0).map(|row| row.x), Some(-4));
+    assert!(appended.capacity() > initial_capacity);
+}
+
+#[test]
+fn generated_soa_growth_preserves_live_column_addresses_after_front_removal() {
+    let mut entities = ECS::<Position>::with_growable_capacity(2).unwrap();
+    entities.extend([Position { x: 1, y: 10 }, Position { x: 2, y: 20 }]);
+    assert_eq!(
+        entities.pop_front().map(|row| (row.x, row.y)),
+        Some((1, 10))
+    );
+
+    let addresses = (
+        entities.storage().x.get(0).unwrap() as *const i32,
+        entities.storage().y.get(0).unwrap() as *const i32,
+    );
+    let initial_capacity = entities.capacity();
+
+    entities.push(Position { x: 3, y: 30 }).unwrap();
+    entities.push(Position { x: 4, y: 40 }).unwrap();
+
+    assert!(entities.capacity() > initial_capacity);
+    assert_eq!(
+        (
+            entities.storage().x.get(0).unwrap() as *const i32,
+            entities.storage().y.get(0).unwrap() as *const i32,
+        ),
+        addresses
+    );
+    assert_eq!(
+        entities.get_cloned(0).map(|row| (row.x, row.y)),
+        Some((2, 20))
+    );
+}
+
+#[test]
+fn default_ecs_fieldless_rows_have_no_arbitrary_capacity_limit() {
+    let mut entities = ECS::<Empty>::new();
+
+    assert_eq!(entities.capacity(), usize::MAX);
+    entities.try_extend((0..2048).map(|_| Empty)).unwrap();
+
+    assert_eq!(entities.len(), 2048);
+    assert_eq!(entities.capacity(), usize::MAX);
+    assert!(entities.get_cloned(2047).is_some());
+}
+
+#[test]
+fn default_ecs_zero_sized_columns_have_no_arbitrary_capacity_limit() {
+    let mut entities = ECS::<ZeroSizedColumn>::new();
+
+    assert_eq!(entities.capacity(), usize::MAX);
+    entities
+        .try_extend((0..2048).map(|_| ZeroSizedColumn {
+            marker: std::marker::PhantomData,
+        }))
+        .unwrap();
+    assert_eq!(entities.len(), 2048);
+    assert!(entities.get_cloned(2047).is_some());
 }
 
 #[test]
@@ -97,6 +301,41 @@ fn unit_soa_generated_operations_track_rows_and_capacity() {
     assert!(!Empty::truncate(&mut storage, 1));
     Empty::clear(&mut storage);
     assert!(Empty::push_to(&mut storage, Empty).is_ok());
+}
+
+#[test]
+fn unit_soa_rejects_growth_below_live_row_count_without_mutation() {
+    let mut storage = Empty::create_storage(2).unwrap();
+    Empty::push_to(&mut storage, Empty).unwrap();
+    Empty::push_to(&mut storage, Empty).unwrap();
+
+    assert!(Empty::grow_storage(&mut storage, 2, 1).is_err());
+    assert!(Empty::clone_at(&storage, 1).is_some());
+    assert!(Empty::push_to(&mut storage, Empty).is_err());
+}
+
+#[test]
+fn derived_soa_rejects_growth_below_live_rows_without_mutation() {
+    let mut storage = Position::create_storage(2).unwrap();
+    Position::push_to(&mut storage, Position { x: 3, y: 8 }).unwrap();
+    Position::push_to(&mut storage, Position { x: -4, y: 11 }).unwrap();
+    let initial_capacities = (storage.x.capacity(), storage.y.capacity());
+
+    assert!(Position::grow_storage(&mut storage, 2, 1).is_err());
+    assert_eq!(
+        (storage.x.capacity(), storage.y.capacity()),
+        initial_capacities
+    );
+    assert_eq!(storage.x.len(), 2);
+    assert_eq!(storage.y.len(), 2);
+    assert_eq!(
+        Position::clone_at(&storage, 0).map(|row| (row.x, row.y)),
+        Some((3, 8))
+    );
+    assert_eq!(
+        Position::clone_at(&storage, 1).map(|row| (row.x, row.y)),
+        Some((-4, 11))
+    );
 }
 
 #[test]

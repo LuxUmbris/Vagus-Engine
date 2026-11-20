@@ -5,4 +5,4 @@ spv
 cache
 .o
 .lib
-.a
+.a*

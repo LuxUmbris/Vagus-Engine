@@ -173,6 +173,18 @@ impl Window {
         Ok(())
     }
 
+    /// Updates the surrounding UTF-8 text used by Wayland input methods.
+    /// Cursor and anchor are byte offsets into `text` and must be character boundaries.
+    pub fn set_text_input_surrounding_text(
+        &mut self,
+        text: &str,
+        cursor_byte_offset: usize,
+        anchor_byte_offset: usize,
+    ) -> Result<(), String> {
+        self.backend
+            .set_surrounding_text(text, cursor_byte_offset, anchor_byte_offset)
+    }
+
     /// Requests a native resize; cached dimensions update when the backend reports it.
     pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), String> {
         if width == 0 || height == 0 {

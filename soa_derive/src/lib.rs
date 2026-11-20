@@ -67,6 +67,9 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
         ),
         Fields::Unit => (Vec::new(), Vec::new(), Vec::new()),
     };
+    let storage_row_bytes = field_types.iter().fold(quote!(0usize), |sum, field_type| {
+        quote! { #sum + ::core::mem::size_of::<#field_type>() }
+    });
 
     let value_names: Vec<_> = (0..field_names.len())
         .map(|i| format_ident!("__soa_value_{i}"))
@@ -100,6 +103,16 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
     } else {
         quote!(#(storage.#field_names.len() >= len)&&*)
     };
+    let all_columns_exact_len = if field_names.is_empty() {
+        quote!(true)
+    } else {
+        quote!(#(storage.#field_names.len() == len)&&*)
+    };
+    let all_other_columns_exact_len = if field_names.is_empty() {
+        quote!(true)
+    } else {
+        quote!(#(other.#field_names.len() == additional)&&*)
+    };
 
     let mut clone_generics = input.generics.clone();
     if !field_types.is_empty() {
@@ -114,6 +127,7 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
         clone_generics.split_for_impl();
 
     let has_no_columns = field_names.is_empty();
+    let has_columns = !has_no_columns;
     let storage_state = if has_no_columns {
         quote! { __soa_len: usize, __soa_capacity: usize, }
     } else {
@@ -137,9 +151,90 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
     } else {
         quote! {
             #(
-                storage.#field_names.prepare_additional(additional)?;
+                storage.#field_names.prepare_additional_relocating(additional)?;
             )*
             Ok(())
+        }
+    };
+    let append_storage_body = if has_no_columns {
+        quote! {
+            if other.__soa_len != additional {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::InvalidData,
+                    "SoA source row count is inconsistent",
+                ));
+            }
+            Self::prepare_append(storage, additional)?;
+            storage.__soa_len += additional;
+            other.__soa_len = 0;
+            other.__soa_capacity = other_capacity;
+            Ok(())
+        }
+    } else {
+        quote! {
+            if !(#all_other_columns_exact_len) {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::InvalidData,
+                    "SoA source columns have inconsistent lengths",
+                ));
+            }
+            let replacement = Self::create_storage(other_capacity)?;
+            Self::prepare_append(storage, additional)?;
+            #(
+                storage.#field_names.reserve_append(&other.#field_names)?;
+            )*
+            #(
+                storage.#field_names.append(&mut other.#field_names);
+            )*
+            *other = replacement;
+            Ok(())
+        }
+    };
+    let grow_storage_body = if has_no_columns {
+        quote! {
+            if storage.__soa_len != len {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::InvalidData,
+                    "SoA row count is inconsistent",
+                ));
+            }
+            if capacity < len {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::InvalidInput,
+                    "SoA capacity is smaller than its row count",
+                ));
+            }
+            let mut grown = Self::create_storage(capacity)?;
+            grown.__soa_len = storage.__soa_len;
+            storage.__soa_len = 0;
+            storage.__soa_capacity = 0;
+            Ok(grown)
+        }
+    } else {
+        quote! {
+            if !(#all_columns_exact_len) {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::InvalidData,
+                    "SoA columns have inconsistent lengths",
+                ));
+            }
+            if capacity < len {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::InvalidInput,
+                    "SoA capacity is smaller than its row count",
+                ));
+            }
+            #(
+                storage.#field_names.grow_to(capacity)?;
+            )*
+            let mut grown = Self::create_storage(0)?;
+            #(
+                grown.#field_names.reserve_append(&storage.#field_names)?;
+            )*
+            #(
+                grown.#field_names.append(&mut storage.#field_names);
+            )*
+            Ok(grown)
         }
     };
     let push_to_body = if has_no_columns {
@@ -192,6 +287,27 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
                 storage.#field_names.insert(index, value.#field_access)?;
             )*
             Ok(())
+        }
+    };
+    let replace_at_body = if has_no_columns {
+        quote! {
+            if index >= storage.__soa_len {
+                return Err(value);
+            }
+            Ok(value)
+        }
+    } else {
+        quote! {
+            if !(#row_exists) {
+                return Err(value);
+            }
+            #(
+                let #value_names = ::core::mem::replace(
+                    storage.#field_names.get_mut(index).expect("checked SoA row"),
+                    value.#field_access,
+                );
+            )*
+            Ok(#row_from_values)
         }
     };
     let remove_body = if has_no_columns {
@@ -311,7 +427,7 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, Debug, PartialEq)]
         pub struct #storage_name #generics {
             #(pub #field_names: ::vagus::essential::collections::StableVec<#field_types>,)*
             #storage_state
@@ -319,6 +435,8 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
 
         impl #impl_generics ::vagus::ecs::Soa for #name #type_generics #where_clause {
             type Storage = #storage_name #type_generics;
+            const HAS_COLUMNS: bool = #has_columns;
+            const STORAGE_ROW_BYTES: Option<usize> = Some(#storage_row_bytes);
 
             fn create_storage(capacity: usize) -> ::std::io::Result<Self::Storage> {
                 Ok(#storage_name {
@@ -330,11 +448,28 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
                 })
             }
 
+            fn grow_storage(
+                storage: &mut Self::Storage,
+                len: usize,
+                capacity: usize,
+            ) -> ::std::io::Result<Self::Storage> {
+                #grow_storage_body
+            }
+
             fn prepare_append(
                 storage: &mut Self::Storage,
                 additional: usize,
             ) -> ::std::io::Result<()> {
                 #prepare_append_body
+            }
+
+            fn append_storage(
+                storage: &mut Self::Storage,
+                other: &mut Self::Storage,
+                additional: usize,
+                other_capacity: usize,
+            ) -> ::std::io::Result<()> {
+                #append_storage_body
             }
 
             fn push_to(
@@ -350,6 +485,14 @@ pub fn derive_soa(input: TokenStream) -> TokenStream {
                 value: Self,
             ) -> ::std::io::Result<()> {
                 #insert_body
+            }
+
+            fn replace_at(
+                storage: &mut Self::Storage,
+                index: usize,
+                value: Self,
+            ) -> Result<Self, Self> {
+                #replace_at_body
             }
 
             fn remove(storage: &mut Self::Storage, index: usize) -> Option<Self> {
