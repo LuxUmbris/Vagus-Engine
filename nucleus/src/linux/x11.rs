@@ -548,6 +548,7 @@ unsafe extern "C" {
 #[link(name = "X11")]
 unsafe extern "C" {
     fn XOpenDisplay(name: *const c_char) -> *mut Display;
+    #[allow(dead_code)]
     fn XkbGetDetectableAutoRepeat(display: *mut Display, supported: *mut c_int) -> c_int;
     fn XkbSetDetectableAutoRepeat(
         display: *mut Display,
@@ -643,6 +644,7 @@ unsafe extern "C" {
         time: c_ulong,
     ) -> c_int;
     fn XFlush(display: *mut Display) -> c_int;
+    #[allow(dead_code)]
     fn XSync(display: *mut Display, discard: c_int) -> c_int;
     fn XPending(display: *mut Display) -> c_int;
     fn XNextEvent(display: *mut Display, event: *mut XEvent) -> c_int;

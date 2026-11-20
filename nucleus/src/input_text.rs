@@ -11,6 +11,7 @@
 //!
 //! Authors: Vincent Noll
 
+#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct Utf16InputState {
     pending_high_surrogate: Option<u16>,
@@ -86,6 +87,7 @@ pub(crate) fn emit_ime_composition_events(
 }
 
 impl Utf16InputState {
+    #[allow(dead_code)]
     pub(crate) fn push(&mut self, unit: u16) -> Option<char> {
         if (0xd800..=0xdbff).contains(&unit) {
             self.pending_high_surrogate = Some(unit);
@@ -103,6 +105,7 @@ impl Utf16InputState {
         char::from_u32(unit as u32)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_codepoint(&mut self, codepoint: u32) -> Option<char> {
         self.reset();
         char::from_u32(codepoint)
@@ -116,8 +119,8 @@ impl Utf16InputState {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_utf16_preedit, decode_utf16_text, emit_ime_composition_events,
-        utf16_offset_to_utf8_byte_offset, Utf16InputState,
+        Utf16InputState, decode_utf16_preedit, decode_utf16_text, emit_ime_composition_events,
+        utf16_offset_to_utf8_byte_offset,
     };
     use crate::Event;
 
